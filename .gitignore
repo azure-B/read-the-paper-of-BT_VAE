@@ -1,0 +1,4 @@
+DataSet/
+.venv/
+JustDoit.code-workspace
+open-wsl.ps1
