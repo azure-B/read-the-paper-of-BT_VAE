@@ -1,4 +1,5 @@
 import cv2
+import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
@@ -117,4 +118,30 @@ mask_files = [
         file for folder in file_path for file in glob.glob(folder) if 'mask' in file
 ]
 
-print(mask_files)
+#common_file Set up
+for file in common_files:
+
+    # load file
+    parent_folder = pathlib.Path(file).parent.name
+    proceesed = cv2.imread(file, cv2.IMREAD_GRAYSCALE)
+
+    # normalization
+    proceesed = torch.from_numpy(proceesed).float()
+    proceesed = proceesed.unsqueeze(0) / 255
+
+    # Save np
+    np.save(f"DataSet/Processed/1_/{parent_folder}/{pathlib.Path(file).name}", proceesed)
+
+for file in mask_files :
+    
+    #load file
+    parent_folder = pathlib.Path(file).parent.name
+    proceesed = cv2.imread(file, cv2.IMREAD_GRAYSCALE)
+    
+    #cv2 Error
+    _, proceesed = cv2.threshold(proceesed, 128, 1, cv2.THRESH_BINARY)
+    proceesed = torch.from_numpy(proceesed).float()
+    proceesed = proceesed.unsqueeze(0)
+
+    # Save np
+    np.save(f"DataSet/Processed/1_/{parent_folder}/{pathlib.Path(file).name}", proceesed)
