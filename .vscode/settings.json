@@ -1,5 +1,8 @@
 {
   "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/AUE_Model"
+  ],
   "python.terminal.activateEnvironment": true,
   "remote.WSL.fileWatcher.polling": false,
   "cursor.tab.enabled": false,
