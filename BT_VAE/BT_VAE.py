@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 from dataclasses import dataclass
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader,random_split
 
 from get_data import get_data
 # import glob
@@ -17,7 +17,9 @@ class Config:
     z_dim: int = 32  
     lr: float = 1e-3
     lr2: float = 1e-3
-    beta: float = 1.0
+    alpha: float = 0.99
+    beta: float = 1e-5
+    eps: float = 1e-5
     pre_epoch: int = 30
     tune_epoch: int = 30
     batch_size: int = 64
@@ -118,23 +120,24 @@ class BT_VAE(nn.Module):
                     BT_loss += (eye[i][j] - CM[i][j]).pow(2) * w
 
         BT_loss = BT_loss / (shape * shape)
-        print(BT_loss)
         return BT_loss  
 
     @staticmethod
-    def get_VAE_Loss(recon, x, log_var, mu, beta):
+    def get_VAE_Loss(recon, x, log_var, mu, dice, alpha, beta):
         recon_loss = F.binary_cross_entropy(recon, x, reduction='mean')
-        kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
+        recon_loss = (alpha * dice) + (recon_loss * (1-alpha))
+        kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
 
-        print(f'recon : {recon_loss}, kl : {kl_loss}')
+        print(f'recon : {recon_loss}, kl : {kl_loss * beta}')
 
         return recon_loss + kl_loss * beta
 
-    @staticmethod 
-    def get_Loss(VAE_Loss,BT_Loss):
-        return VAE_Loss + BT_Loss
+    @staticmethod
+    def dice_loss(recon, y, eps):
+        dice = (recon * y).sum() *2
+        dice = (dice + eps) / ((recon.sum() + y.sum()) + eps)
+        return 1 - dice
 
-    
 
 # model Testing
 if __name__ == '__main__':
@@ -168,7 +171,17 @@ if __name__ == '__main__':
     # print(loss.item)
 
     data = get_data('DataSet/Processed/1_/train')
-    loader = DataLoader(data, batch_size = Config.batch_size, shuffle=True )
+    
+    total_len = len(data)
+
+    train_len = int(len(data)*0.7)
+    val_len = int(len(data)-train_len)
+
+    train_data, val_data = random_split(data, [train_len, val_len])
+
+    train_loader = DataLoader(train_data, batch_size = Config.batch_size, shuffle=True )
+    val_loader = DataLoader(val_data, batch_size = Config.batch_size, shuffle=False )
+
     op1 = torch.optim.Adam(model.parameters(), lr=Config.lr)
 
 
@@ -177,7 +190,7 @@ if __name__ == '__main__':
         total_BT_loss = 0
         count = 0
 
-        for x,y in loader:
+        for x,y in train_loader:
             x = x.to(device)
             
             CM, z, recon, log_var, mu = model(x)
@@ -199,13 +212,15 @@ if __name__ == '__main__':
         total_VAE_loss = 0
         count = 0
 
-        for x in loader:
+        for x,y in train_loader:
             x = x.to(device)
             y = y.to(device)
 
 
             CM, z, recon, log_var, mu = model(x)
-            loss = model.get_VAE_Loss(recon, y, log_var, mu, Config.beta)
+            dice = model.dice_loss(recon, y, Config.eps)
+
+            loss = model.get_VAE_Loss(recon, y, log_var, mu, dice, Config.alpha, Config.beta)
 
             op2.zero_grad()
             loss.backward()
@@ -213,5 +228,23 @@ if __name__ == '__main__':
             total_VAE_loss += loss.item()
 
             count += 1    
-            
         print(f"epoch {epoch}, VAE: { total_VAE_loss / count }")
+
+    model.eval()
+
+    with torch.no_grad():
+        count = 0
+        total_loss = 0
+        for x, y in val_loader:            
+            x = x.to(device)
+            y = y.to(device)
+            CM, z, recon, log_var, mu = model(x)
+            dice = model.dice_loss(recon, y, Config.eps)
+
+            total_loss += model.get_VAE_Loss(recon, y, log_var, mu, dice, Config.alpha, Config.beta).item()
+            count += 1
+
+        print(f"total_loss : {total_loss/count}")
+            
+
+
