@@ -167,7 +167,7 @@ if __name__ == '__main__':
     # loss = model.VAE_Loss(recon, x, log_var, mu, beta=Config.beta)
     # print(loss.item)
 
-    data = get_data('DataSet/Processed/1_/test')
+    data = get_data('DataSet/Processed/1_/train')
     loader = DataLoader(data, batch_size = Config.batch_size, shuffle=True )
     op1 = torch.optim.Adam(model.parameters(), lr=Config.lr)
 
@@ -177,9 +177,9 @@ if __name__ == '__main__':
         total_BT_loss = 0
         count = 0
 
-        for x in loader:
+        for x,y in loader:
             x = x.to(device)
-
+            
             CM, z, recon, log_var, mu = model(x)
             loss = model.get_BT_VAE_Loss(CM)
             
@@ -201,9 +201,11 @@ if __name__ == '__main__':
 
         for x in loader:
             x = x.to(device)
+            y = y.to(device)
+
 
             CM, z, recon, log_var, mu = model(x)
-            loss = model.get_VAE_Loss(recon, x, log_var, mu, Config.beta)
+            loss = model.get_VAE_Loss(recon, y, log_var, mu, Config.beta)
 
             op2.zero_grad()
             loss.backward()
@@ -211,4 +213,5 @@ if __name__ == '__main__':
             total_VAE_loss += loss.item()
 
             count += 1    
-        print(f"epoch {epoch}, BT: { total_VAE_loss / count }")
+            
+        print(f"epoch {epoch}, VAE: { total_VAE_loss / count }")
