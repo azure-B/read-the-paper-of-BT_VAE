@@ -20,7 +20,7 @@ class Config:
     alpha: float = 0.99
     beta: float = 1e-5
     eps: float = 1e-5
-    pre_epoch: int = 30
+    pre_epoch: int = 10
     tune_epoch: int = 30
     batch_size: int = 64
 
@@ -125,6 +125,7 @@ class BT_VAE(nn.Module):
     @staticmethod
     def get_VAE_Loss(recon, x, log_var, mu, dice, alpha, beta):
         recon_loss = F.binary_cross_entropy(recon, x, reduction='mean')
+        print(f"fure recon_loss : {recon_loss}")
         recon_loss = (alpha * dice) + (recon_loss * (1-alpha))
         kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
 
@@ -135,7 +136,9 @@ class BT_VAE(nn.Module):
     @staticmethod
     def dice_loss(recon, y, eps):
         dice = (recon * y).sum() *2
+        print(f"dices form recon : {dice}")
         dice = (dice + eps) / ((recon.sum() + y.sum()) + eps)
+        print(f"dice : {dice}")
         return 1 - dice
 
 
@@ -182,28 +185,28 @@ if __name__ == '__main__':
     train_loader = DataLoader(train_data, batch_size = Config.batch_size, shuffle=True )
     val_loader = DataLoader(val_data, batch_size = Config.batch_size, shuffle=False )
 
-    op1 = torch.optim.Adam(model.parameters(), lr=Config.lr)
+    # op1 = torch.optim.Adam(model.parameters(), lr=Config.lr)
 
 
-    for epoch in range(Config.pre_epoch):
-        total_loss = 0
-        total_BT_loss = 0
-        count = 0
+    # for epoch in range(Config.pre_epoch):
+    #     total_loss = 0
+    #     total_BT_loss = 0
+    #     count = 0
 
-        for x,y in train_loader:
-            x = x.to(device)
+    #     for x,y in train_loader:
+    #         x = x.to(device)
             
-            CM, z, recon, log_var, mu = model(x)
-            loss = model.get_BT_VAE_Loss(CM)
+    #         CM, z, recon, log_var, mu = model(x)
+    #         loss = model.get_BT_VAE_Loss(CM)
             
-            op1.zero_grad()
-            loss.backward()
-            op1.step()
-            total_loss += loss.item()
+    #         op1.zero_grad()
+    #         loss.backward()
+    #         op1.step()
+    #         total_loss += loss.item()
             
-            count += 1    
-            total_BT_loss += loss.item()
-        print(f"epoch {epoch}, BT: { total_BT_loss / count }")
+    #         count += 1    
+    #         total_BT_loss += loss.item()
+    #     print(f"epoch {epoch}, BT: { total_BT_loss / count }")
 
     op2 = torch.optim.Adam(model.parameters(), lr=Config.lr2)
 
