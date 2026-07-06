@@ -2,7 +2,25 @@ import torch
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
+from dataclasses import dataclass
+from torch.utils.data import DataLoader
+
+from get_data import get_data
 # import glob
+
+@dataclass
+class Config:
+    stride: int = 2
+    kernel_size: int = 3
+    padding: int = 1
+    output_padding: int = 1
+    z_dim: int = 32  
+    lr: float = 1e-3
+    lr2: float = 1e-3
+    beta: float = 1.0
+    pre_epoch: int = 30
+    tune_epoch: int = 30
+    batch_size: int = 64
 
 class BT_VAE(nn.Module):
     def __init__(self, z_dim=32, stride=2, kernel_size = 3, padding = 1, output_padding = 1):
@@ -12,14 +30,18 @@ class BT_VAE(nn.Module):
         self.kernel_size = kernel_size
         self.padding = padding
 
+        def conv_block(in_c, out_c):
+            return nn.Sequential(
+                nn.Conv2d(in_c, out_c, kernel_size, stride, padding),
+                nn.ReLU()
+            )
+
         # BT pre_trained
         # we want to matrix output
         # shape ( batch, 32, 105, 145 )
         self.encoder = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size , stride , padding ),
-            nn.ReLU(),
-            nn.Conv2d(16, z_dim, kernel_size, stride, padding),
-            nn.ReLU(),
+           conv_block(1,16),
+           conv_block(16,32)
         )
 
         self.decoder = nn.Sequential(
@@ -85,23 +107,26 @@ class BT_VAE(nn.Module):
     def get_BT_VAE_Loss(CM):
         shape = CM.shape[0]
         eye = torch.eye(shape, device=CM.device)
-        loss = 0
+        BT_loss = 0
         w = 0.2
 
         for i in range(shape):
             for j in range(shape):
                 if i == j:
-                    loss += (eye[i][j] - CM[i][j]).pow(2)
+                    BT_loss += (eye[i][j] - CM[i][j]).pow(2)
                 else:
-                    loss += (eye[i][j] - CM[i][j]).pow(2) * w
+                    BT_loss += (eye[i][j] - CM[i][j]).pow(2) * w
 
-        return loss
+        BT_loss = BT_loss / (shape * shape)
+        print(BT_loss)
+        return BT_loss  
 
     @staticmethod
-    def VAE_Loss(recon, x, log_var, mu):
-        recon_loss = F.binary_cross_entropy(recon, x, reduction='sum')
-        kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
-        beta = 1
+    def get_VAE_Loss(recon, x, log_var, mu, beta):
+        recon_loss = F.binary_cross_entropy(recon, x, reduction='mean')
+        kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
+
+        print(f'recon : {recon_loss}, kl : {kl_loss}')
 
         return recon_loss + kl_loss * beta
 
@@ -114,23 +139,76 @@ class BT_VAE(nn.Module):
 # model Testing
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = BT_VAE(z_dim = 32)
+    model = BT_VAE(
+        z_dim=Config.z_dim,
+        stride=Config.stride,
+        kernel_size=Config.kernel_size,
+        padding=Config.padding,
+    )
+
     model.to(device)
-    op = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # glob always out list
     # if i want to input just one file,
     # i can use np.load
-    x = np.load('DataSet/Processed/1_/test/1.tif.npy')
+    # x = np.load('DataSet/Processed/1_/test/1.tif.npy')
 
     # npy to tensor
-    x = torch.tensor(x).float()
-    x = x.unsqueeze(0)
-    x = x.to(device)
-    print(x.shape)
+    # x = torch.tensor(x).float()
+    # x = x.unsqueeze(0)
+    # x = x.to(device)
+    # print(x.shape)
 
 
     # print(x.shape)
-    CM, z, recon, log_var, mu = model(x)
-    print("CM:", CM.shape)
-    print("recon:", recon.shape)
+    # CM, z, recon, log_var, mu = model(x)
+    # print("CM:", CM.shape)
+    # print("recon:", recon.shape)
+    # loss = model.VAE_Loss(recon, x, log_var, mu, beta=Config.beta)
+    # print(loss.item)
+
+    data = get_data('DataSet/Processed/1_/test')
+    loader = DataLoader(data, batch_size = Config.batch_size, shuffle=True )
+    op1 = torch.optim.Adam(model.parameters(), lr=Config.lr)
+
+
+    for epoch in range(Config.pre_epoch):
+        total_loss = 0
+        total_BT_loss = 0
+        count = 0
+
+        for x in loader:
+            x = x.to(device)
+
+            CM, z, recon, log_var, mu = model(x)
+            loss = model.get_BT_VAE_Loss(CM)
+            
+            op1.zero_grad()
+            loss.backward()
+            op1.step()
+            total_loss += loss.item()
+            
+            count += 1    
+            total_BT_loss += loss.item()
+        print(f"epoch {epoch}, BT: { total_BT_loss / count }")
+
+    op2 = torch.optim.Adam(model.parameters(), lr=Config.lr2)
+
+    for epoch in range(Config.tune_epoch):
+        total_loss = 0
+        total_VAE_loss = 0
+        count = 0
+
+        for x in loader:
+            x = x.to(device)
+
+            CM, z, recon, log_var, mu = model(x)
+            loss = model.get_VAE_Loss(recon, x, log_var, mu, Config.beta)
+
+            op2.zero_grad()
+            loss.backward()
+            op2.step()
+            total_VAE_loss += loss.item()
+
+            count += 1    
+        print(f"epoch {epoch}, BT: { total_VAE_loss / count }")

@@ -1,11 +1,15 @@
 from torch.utils.data import Dataset
-import glob, numpy as np, torch
+import numpy as np
+import torch
+import glob
 
-class NpyDataset(Dataset):
+class get_data(Dataset):
     def __init__(self, folder):
-        self.files = glob.glob(folder + "/*.npy") 
+        self.files = glob.glob(folder + '/*.npy')
+
     def __len__(self):
         return len(self.files)
-    def __getitem__(self, i):
+
+    def __getitem__(self,i):
         x = np.load(self.files[i])
         return torch.from_numpy(x).float()        
