@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from torch.utils.data import DataLoader,random_split
 
@@ -10,10 +11,10 @@ from get_data import get_data
 
 @dataclass
 class Config:
-    stride: int = 2
+    stride: int = 1
     kernel_size: int = 3
-    padding: int = 1
-    output_padding: int = 1
+    padding: int = 0
+    output_padding: int = 0
     z_dim: int = 32  
     lr: float = 1e-3
     lr2: float = 1e-3
@@ -21,40 +22,56 @@ class Config:
     beta: float = 1e-5
     eps: float = 1e-5
     pre_epoch: int = 10
-    tune_epoch: int = 30
-    batch_size: int = 64
+    tune_epoch: int = 50
+    batch_size: int = 32
 
 class BT_VAE(nn.Module):
-    def __init__(self, z_dim=32, stride=2, kernel_size = 3, padding = 1, output_padding = 1):
+    def __init__(self, z_dim=128, stride=2, kernel_size = 3, padding = 1, output_padding = 1):
         super().__init__()
         self.z_dim = z_dim
         self.stride = stride
         self.kernel_size = kernel_size
         self.padding = padding
 
-        def conv_block(in_c, out_c):
-            return nn.Sequential(
-                nn.Conv2d(in_c, out_c, kernel_size, stride, padding),
-                nn.ReLU()
-            )
-
         # BT pre_trained
         # we want to matrix output
         # shape ( batch, 32, 105, 145 )
         self.encoder = nn.Sequential(
-           conv_block(1,16),
-           conv_block(16,32)
-        )
+            nn.Conv2d(1, 16, kernel_size, stride, padding),
+            nn.ReLU(),
+
+            nn.Conv2d(16, 32, kernel_size, stride, padding),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size = 2, stride = 2),
+
+            nn.Conv2d(32, 64, kernel_size, stride, padding),
+            nn.ReLU(),
+
+            nn.Conv2d(64, 128, kernel_size, stride, padding),
+            nn.ReLU(),
+
+            nn.Conv2d(128, 256, kernel_size, stride, padding),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size = 2, stride = 2)
+
+      )
 
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(z_dim, 16, kernel_size, stride, padding, output_padding),
+            nn.ConvTranspose2d(z_dim, 64, kernel_size, stride, padding, output_padding),
             nn.ReLU(),
+
+            nn.ConvTranspose2d(64, 32, kernel_size, stride, padding, output_padding),
+            nn.ReLU(),
+
+            nn.ConvTranspose2d(32, 16, kernel_size, stride, padding, output_padding),
+            nn.ReLU(),
+
             nn.ConvTranspose2d(16, 1, kernel_size, stride, padding, output_padding),
             nn.Sigmoid()
         )
 
-        self.log_var = nn.Conv2d( 32, z_dim, kernel_size = 1 )
-        self.mu = nn.Conv2d( 32, z_dim, kernel_size = 1 )
+        self.log_var = nn.Conv2d( 256, z_dim, kernel_size = 1 )
+        self.mu = nn.Conv2d( 256, z_dim, kernel_size = 1 )
 
 
     def encode(self, x):
@@ -123,23 +140,26 @@ class BT_VAE(nn.Module):
         return BT_loss  
 
     @staticmethod
-    def get_VAE_Loss(recon, x, log_var, mu, dice, alpha, beta):
+    def get_VAE_Loss(recon, x, log_var, mu, dice, alpha, beta, total_epoch, epoch):
         recon_loss = F.binary_cross_entropy(recon, x, reduction='mean')
-        print(f"fure recon_loss : {recon_loss}")
+        print(f"fure_recon : {recon_loss}")
+        alpha = alpha * (epoch / total_epoch)
         recon_loss = (alpha * dice) + (recon_loss * (1-alpha))
         kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
 
-        print(f'recon : {recon_loss}, kl : {kl_loss * beta}')
-
+        print(f"mu :{mu}, log_var : {log_var}")
+        print(f"recon : {recon_loss}, kl_loss : {kl_loss}")
         return recon_loss + kl_loss * beta
 
     @staticmethod
     def dice_loss(recon, y, eps):
-        dice = (recon * y).sum() *2
-        print(f"dices form recon : {dice}")
-        dice = (dice + eps) / ((recon.sum() + y.sum()) + eps)
-        print(f"dice : {dice}")
-        return 1 - dice
+        # print(f"means : {recon.mean()}, {y.mean()}")
+        dice = (recon * y).sum(dim=[1, 2, 3]) * 2
+        # print(f"recon * y : {recon * y}")
+        dice = (dice + eps) / ((recon.sum(dim=[1, 2, 3]) + y.sum(dim=[1, 2, 3])) + eps)
+        # print(f"dice : {dice}")
+
+        return (1 - dice).mean()
 
 
 # model Testing
@@ -150,6 +170,7 @@ if __name__ == '__main__':
         stride=Config.stride,
         kernel_size=Config.kernel_size,
         padding=Config.padding,
+        output_padding=Config.output_padding,
     )
 
     model.to(device)
@@ -173,7 +194,7 @@ if __name__ == '__main__':
     # loss = model.VAE_Loss(recon, x, log_var, mu, beta=Config.beta)
     # print(loss.item)
 
-    data = get_data('DataSet/Processed/1_/train')
+    data = get_data('DataSet/Processed/1_/train', only_p = True)
     
     total_len = len(data)
 
@@ -182,31 +203,39 @@ if __name__ == '__main__':
 
     train_data, val_data = random_split(data, [train_len, val_len])
 
-    train_loader = DataLoader(train_data, batch_size = Config.batch_size, shuffle=True )
+    train_loader = DataLoader(train_data, batch_size = Config.batch_size, shuffle=True)
     val_loader = DataLoader(val_data, batch_size = Config.batch_size, shuffle=False )
 
-    # op1 = torch.optim.Adam(model.parameters(), lr=Config.lr)
+    op1 = torch.optim.Adam(model.parameters(), lr=Config.lr)
+    best_loss = float('inf')
 
+    for epoch in range(Config.pre_epoch):
+        total_loss = 0
+        total_BT_loss = 0
+        count = 0
 
-    # for epoch in range(Config.pre_epoch):
-    #     total_loss = 0
-    #     total_BT_loss = 0
-    #     count = 0
+        for x,y in train_loader:
+            x = x.to(device)
+            
+            CM, z, recon, log_var, mu = model(x)
+            loss = model.get_BT_VAE_Loss(CM)
 
-    #     for x,y in train_loader:
-    #         x = x.to(device)
             
-    #         CM, z, recon, log_var, mu = model(x)
-    #         loss = model.get_BT_VAE_Loss(CM)
             
-    #         op1.zero_grad()
-    #         loss.backward()
-    #         op1.step()
-    #         total_loss += loss.item()
+            op1.zero_grad()
+            loss.backward()
+            op1.step()
+            total_loss += loss.item()
             
-    #         count += 1    
-    #         total_BT_loss += loss.item()
-    #     print(f"epoch {epoch}, BT: { total_BT_loss / count }")
+            count += 1    
+            total_BT_loss += loss.item()
+            common = total_BT_loss / count 
+        if common < best_loss:
+            best_loss = loss.item()
+            torch.save(model.state_dict(), 'BT_best.pth')
+        print(f"epoch {epoch}, BT: { common }")
+
+    model.load_state_dict(torch.load('BT_best.pth'))
 
     op2 = torch.optim.Adam(model.parameters(), lr=Config.lr2)
 
@@ -219,11 +248,10 @@ if __name__ == '__main__':
             x = x.to(device)
             y = y.to(device)
 
-
             CM, z, recon, log_var, mu = model(x)
             dice = model.dice_loss(recon, y, Config.eps)
 
-            loss = model.get_VAE_Loss(recon, y, log_var, mu, dice, Config.alpha, Config.beta)
+            loss = model.get_VAE_Loss(recon, y, log_var, mu, dice, Config.alpha, Config.beta, Config.tune_epoch, epoch)
 
             op2.zero_grad()
             loss.backward()
@@ -232,6 +260,12 @@ if __name__ == '__main__':
 
             count += 1    
         print(f"epoch {epoch}, VAE: { total_VAE_loss / count }")
+
+
+
+    data = get_data('DataSet/Processed/1_/train', only_p = False)
+    val_loader = DataLoader(data, batch_size = Config.batch_size, shuffle=False )
+
 
     model.eval()
 
