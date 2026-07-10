@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from torch.utils.data import DataLoader,random_split
+from tqdm import tqdm
 
 from get_data import get_data
 # import glob
@@ -21,9 +22,9 @@ class Config:
     alpha: float = 0.99
     beta: float = 1e-5
     eps: float = 1e-5
-    pre_epoch: int = 10
+    pre_epoch: int = 5
     tune_epoch: int = 50
-    batch_size: int = 32
+    batch_size: int = 16
 
 class BT_VAE(nn.Module):
     def __init__(self, z_dim=128, stride=2, kernel_size = 3, padding = 1, output_padding = 1):
@@ -142,13 +143,13 @@ class BT_VAE(nn.Module):
     @staticmethod
     def get_VAE_Loss(recon, x, log_var, mu, dice, alpha, beta, total_epoch, epoch):
         recon_loss = F.binary_cross_entropy(recon, x, reduction='mean')
-        print(f"fure_recon : {recon_loss}")
+        # print(f"fure_recon : {recon_loss}")
         alpha = alpha * (epoch / total_epoch)
         recon_loss = (alpha * dice) + (recon_loss * (1-alpha))
         kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
 
-        print(f"mu :{mu}, log_var : {log_var}")
-        print(f"recon : {recon_loss}, kl_loss : {kl_loss}")
+        print(f"mu :{mu.mean().item()}, log_var : {log_var.mean().item()}")
+        print(f"recon : {recon_loss.item()}, kl_loss : {kl_loss.item()}")
         return recon_loss + kl_loss * beta
 
     @staticmethod
@@ -208,20 +209,20 @@ if __name__ == '__main__':
 
     op1 = torch.optim.Adam(model.parameters(), lr=Config.lr)
     best_loss = float('inf')
+    
+    model.load_state_dict(torch.load('BT_best.pth'))
+
 
     for epoch in range(Config.pre_epoch):
         total_loss = 0
         total_BT_loss = 0
         count = 0
 
-        for x,y in train_loader:
+        for x, y in tqdm(train_loader, desc=f"epoch {epoch}"):
             x = x.to(device)
             
             CM, z, recon, log_var, mu = model(x)
             loss = model.get_BT_VAE_Loss(CM)
-
-            
-            
             op1.zero_grad()
             loss.backward()
             op1.step()
@@ -230,21 +231,24 @@ if __name__ == '__main__':
             count += 1    
             total_BT_loss += loss.item()
             common = total_BT_loss / count 
+
         if common < best_loss:
             best_loss = loss.item()
             torch.save(model.state_dict(), 'BT_best.pth')
+            
         print(f"epoch {epoch}, BT: { common }")
 
-    model.load_state_dict(torch.load('BT_best.pth'))
 
     op2 = torch.optim.Adam(model.parameters(), lr=Config.lr2)
+    best_loss = float('inf')
+    
 
     for epoch in range(Config.tune_epoch):
         total_loss = 0
         total_VAE_loss = 0
         count = 0
 
-        for x,y in train_loader:
+        for x, y in tqdm(train_loader, desc=f"epoch {epoch}"):
             x = x.to(device)
             y = y.to(device)
 
@@ -259,7 +263,13 @@ if __name__ == '__main__':
             total_VAE_loss += loss.item()
 
             count += 1    
-        print(f"epoch {epoch}, VAE: { total_VAE_loss / count }")
+            common = total_VAE_loss / count
+
+        if common < best_loss:
+            best_loss = loss.item()
+            torch.save(model.state_dict(), 'VAE_best.pth')
+
+        print(f"epoch {epoch}, VAE: { common }")
 
 
 
@@ -272,7 +282,7 @@ if __name__ == '__main__':
     with torch.no_grad():
         count = 0
         total_loss = 0
-        for x, y in val_loader:            
+        for x, y in tqdm(val_loader, desc=f"epoch {epoch}"):
             x = x.to(device)
             y = y.to(device)
             CM, z, recon, log_var, mu = model(x)
