@@ -1,0 +1,53 @@
+---
+description: Implementation discipline while editing code
+alwaysApply: true
+---
+
+# Implementation Discipline
+
+## Surgical editing
+
+- The diff should read as if the original author added the feature themselves: same style, same idioms, same structure.
+- Touch ONLY lines required by the task. Reformatting, import reordering, or renaming unrelated code pollutes the diff and hides the real change. (Exception: your edit triggers the project's auto-formatter — that's fine.)
+- One logical change per turn when possible. If the user asked for A and you discovered prerequisite B, do B, state why, then A — don't silently bundle C, D, E.
+
+## Ordering that keeps the build green
+
+Edit in dependency order so the project compiles at every checkpoint:
+1. Types / interfaces / schemas
+2. Core implementation
+3. Call sites (find ALL of them — grep the symbol, don't trust memory)
+4. Tests
+5. Docs/comments if behavior described anywhere changed
+
+After EVERY file edit: re-read your own diff for that file before moving on. Catching your own typo now costs 5 seconds; catching it after a failed build costs a full loop.
+
+## Reuse before writing
+
+Before writing any utility/helper/component, spend 20 seconds searching whether it exists:
+- date/string/array helpers → search `utils/`, `lib/`, `helpers/`
+- UI element → search `components/` for similar names
+- API call → search for an existing client/service layer for that resource
+
+Duplicating an existing utility is a bug: two implementations will drift.
+
+## Completeness — the "80% done" trap
+
+A weaker agent's signature failure: implementing the happy path and stopping. Before considering implementation finished, walk this list:
+
+- [ ] All code paths handled: what happens on `null`, empty list, duplicate, concurrent call, thrown error?
+- [ ] Every caller of changed functions updated (grep, don't assume)
+- [ ] Errors surfaced properly (typed error / status code / user message per project convention), not swallowed
+- [ ] No leftovers: `console.log`/`print` debugging, commented-out code, `TODO` placeholders, unused imports, dead variables
+- [ ] New strings user-facing? → check if project has i18n; use it
+- [ ] New env var/config introduced? → added to `.env.example` / config schema / README
+- [ ] Feature reachable: route registered, component actually rendered, migration actually included — not just defined
+
+"You can implement the rest similarly" is forbidden. Finish it.
+
+## Editing safety
+
+- Never overwrite a file wholesale when a targeted edit works — full rewrites silently delete code you didn't re-emit.
+- When moving code between files, verify the destination compiles AND the source no longer references the moved symbol.
+- Generated files (lockfiles, `*.gen.ts`, migrations already applied, build output): don't hand-edit; regenerate through the proper tool.
+- If an edit tool fails or applies wrongly, RE-READ the file's current state before retrying. Never stack edits on a stale mental image of the file.

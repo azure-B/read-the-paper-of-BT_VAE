@@ -1,0 +1,39 @@
+---
+description: Git operations, refactoring safety, dependency management
+---
+
+# Git, Refactoring & Dependencies
+
+## Git — safety tiers
+
+**Tier 1 (free to run):** `status`, `diff`, `log`, `show`, `blame`, `branch` (list), `stash list`.
+**Tier 2 (run when task requires):** `add` (specific paths only — never blind `add -A`/`add .`), `commit` when asked, `checkout -b`, `stash push`.
+**Tier 3 (explicit user confirmation required, every time):** `push --force`(-with-lease included), `reset --hard`, `checkout -- .` / `restore` over uncommitted work, `clean -fd`, branch/tag deletion, history rewrites (`rebase` on shared branches, `filter-branch`), anything touching remotes destructively.
+
+Uncommitted user work in the tree is sacred — never let a Tier 3 command eat changes you didn't make.
+
+## Commits (when asked to commit)
+
+- Inspect `git status` + `git diff --staged` BEFORE committing — this is where secrets, debug prints, and stray files get caught.
+- Message = imperative summary of WHY: `fix: prevent double refund when webhook retries (idempotency key on refund op)` — not `update code` / `fix bug`.
+- Follow the repo's convention (scan `git log --oneline -15` for the local dialect: conventional commits? ticket prefixes? emoji? match it).
+- One logical change per commit. Refactor commits and behavior commits stay separate.
+
+## Refactoring — behavior-preserving or it isn't refactoring
+
+- Announce which mode you're in. Never mix "improve structure" and "change behavior" in one step; reviewers can't verify either.
+- Renames/moves: find ALL references before executing — code, strings (dynamic access, DI containers, reflection), configs, docs, CI files, env names. Grep the raw string, not just symbol search.
+- Safety net first: confirm tests cover the area (or add characterization tests capturing current behavior — bugs included) BEFORE restructuring. Refactoring without a net is rewriting with confidence.
+- Strangler pattern for big migrations: new path alongside old, migrate call sites incrementally, delete old only when references hit zero. Keep every intermediate state shippable.
+- Public API changes (exported lib functions, HTTP contracts): deprecate before deleting unless the user owns all consumers and says so.
+
+## Dependencies
+
+- Before adding: (1) stdlib or an existing dep in <30 lines? do that. (2) Otherwise check the candidate: maintained? typed? size? license? transitive deps? State the one-line justification.
+- Install through the project's manager into the correct group (dev vs prod), commit the lockfile. The lockfile decides which manager — never mix npm/yarn/pnpm.
+- Version bumps: patch/minor with a changelog skim; MAJOR bumps require reading the breaking-changes list and grepping usage of each broken API — a major bump is a refactoring task wearing a version number.
+- Never fix a conflict with `--force`/`--legacy-peer-deps` as a first resort; read the resolver's actual constraint conflict.
+
+## Working directory etiquette
+
+End every turn with a clean state you can describe: what's modified, what's untracked and why. No experimental files, `.bak` copies, or half-applied edits left as landmines.

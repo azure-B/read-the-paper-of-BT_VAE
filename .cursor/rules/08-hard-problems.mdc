@@ -1,0 +1,62 @@
+---
+description: Reasoning amplifiers for hard problems - externalized analysis, case enumeration, invariants, decomposition
+alwaysApply: true
+---
+
+# Hard-Problem Protocol: Reasoning Amplifiers
+
+Some tasks exceed what intuition-speed thinking can solve: subtle concurrency, cross-module interactions, tricky algorithms, ambiguous requirements with real design freedom. For these, thinking IN WRITING is not slower — it's the only way to be right. Detect hard problems early and switch to deliberate mode.
+
+## Triggers (any one → this protocol)
+
+- Concurrency/ordering/caching/distributed state is involved
+- The change spans 3+ modules whose interaction you can't fully hold in mind
+- Correctness depends on math/algorithm subtlety (indices, boundaries, numerical stability, invariants)
+- Two consecutive "should work" attempts didn't
+- You notice you're about to write code while still unsure WHY it would be correct ← the honest tell
+
+## Amplifier 1 — Externalize the model before the code
+
+Write (briefly, in your response or plan) the system model your solution depends on:
+- **Invariants**: what must remain true at all times? ("a seat is never double-booked", "cache entry never outlives its row")
+- **State & transitions**: what states exist, what moves between them, what's forbidden?
+- **Who else touches this?** every writer/reader of the data you're changing.
+
+Then design against THAT, not against the happy path in your head. Most subtle bugs are invariant violations the author never wrote down.
+
+## Amplifier 2 — Case enumeration (mechanical, brutally effective)
+
+For any tricky function/branch logic, enumerate before coding:
+- input classes: empty / one / many / max / duplicate / malformed / unicode / negative / zero
+- timing classes: concurrent call, retry, out-of-order arrival, partial failure midway
+- state classes: first-ever run, warm cache, migration-era mixed data
+
+Write the behavior for each class in one phrase; the ones you can't answer are the questions to resolve BEFORE coding. Then the enumeration becomes your test list for free.
+
+## Amplifier 3 — Two designs, then commit
+
+Real design freedom → sketch exactly TWO viable approaches (not five — analysis paralysis is drift too):
+
+```
+A) Optimistic lock (version column): no lock contention; retry logic in 3 call sites
+B) SELECT FOR UPDATE: simpler call sites; holds row locks across the calc (~20ms)
+→ B: calc is cheap, contention is low, simplicity wins here.
+```
+
+The loser's advantages become your risk list. If neither is clearly better, the decision is user-facing — present both in 4 lines and ask.
+
+## Amplifier 4 — Trace the code by hand before running it
+
+For algorithmic code: execute your own implementation mentally on ONE concrete small input, writing intermediate values. `[3,1,2]`, `n=2`, `"ab"` — three lines of trace catches off-by-ones that ten test runs "verify" by accident. For async flows: draw the ordering ("req A starts → B starts → B resolves → A resolves stale — who wins?").
+
+## Amplifier 5 — Decompose past your horizon
+
+If you cannot state with confidence what the code will look like 3 steps ahead, the task is too big for one pass. Split into independently verifiable stages, each leaving the system working; complete and VERIFY stage 1 before designing stage 3 in detail — later stages get cheaper with knowledge stage 1 produces. Propose the staging to the user for anything > ~1 day of human-equivalent work.
+
+## Amplifier 6 — The counter-argument pass
+
+Before committing a hard-problem solution, spend one paragraph arguing it's WRONG, as an adversary: "This breaks if… the strongest objection is… the case I'm least sure of is…". If the counter-argument finds nothing concrete, ship. If it finds something, you just saved a production incident. (This is the REVIEWER mindset pulled forward into design — for hard problems, review can't wait until the end.)
+
+## What this protocol is NOT
+
+Not for routine work — running case enumeration on a button-color change is its own failure (rule 06: match ceremony to stakes). The skill being trained: recognizing WHICH kind of problem you're holding, before it teaches you the hard way.

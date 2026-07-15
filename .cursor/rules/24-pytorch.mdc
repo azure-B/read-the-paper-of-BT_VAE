@@ -1,0 +1,61 @@
+---
+description: PyTorch engineering - tensor correctness, training loop discipline, common silent bugs
+globs: ["**/*.py", "**/*.ipynb"]
+---
+
+# PyTorch Engineering
+
+Deep learning bugs are uniquely evil: the code runs, the loss goes down, and the model is still wrong. Treat "it runs" as meaningless; only "it learns the right thing, verified" counts.
+
+## Shape discipline (the #1 silent-bug source)
+
+- Comment expected shapes at every non-obvious transformation:
+  ```python
+  x = self.encoder(x)          # (B, T, D)
+  x = x.mean(dim=1)            # (B, D) — pool over time
+  logits = self.head(x)        # (B, num_classes)
+  ```
+- **Broadcasting is where correctness goes to die.** `(B,) - (B,1)` silently yields `(B,B)`. Before any elementwise op between tensors of different shapes, verify the broadcast is intended — `assert pred.shape == target.shape` in loss code is cheap insurance and catches the classic MSE-with-broadcast bug that trains "fine" on garbage.
+- `view/reshape` vs `permute/transpose`: `view` reinterprets memory order — using it to "fix" a shape mismatch after a transpose SCRAMBLES data without erroring. Dimension reordering is always permute/transpose (+ `.contiguous()` if needed), never view.
+- `squeeze()` without a dim argument is a landmine (batch size 1 disappears). Always `squeeze(dim)`.
+- einops/`einsum` over chains of view/permute when available — self-documenting and shape-checked.
+
+## Training loop invariants (check every loop you write or review)
+
+```python
+model.train()                                  # 1. mode set (and .eval() for val — dropout/BN differ!)
+for x, y in loader:
+    x, y = x.to(device), y.to(device)          # 2. device moved (non_blocking=True w/ pin_memory)
+    optimizer.zero_grad(set_to_none=True)      # 3. grads cleared EVERY step
+    loss = criterion(model(x), y)              # 4. loss from THIS batch only
+    loss.backward()                            # 5. single backward per graph
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)  # (if clipping: AFTER backward, BEFORE step)
+    optimizer.step()                           # 6. step after backward
+    total += loss.item()                       # 7. .item()/.detach() for logging — see below
+scheduler.step()                               # 8. scheduler at its documented granularity (epoch vs step)
+```
+
+- **Validation/inference**: `model.eval()` + `torch.no_grad()` (or `inference_mode`) — both, always. Forgetting eval() leaks BatchNorm stats and keeps dropout on; forgetting no_grad() leaks memory.
+- **Logging a raw loss tensor keeps the entire graph alive** → OOM that looks random. Accumulate `loss.item()` or `.detach()`.
+- Loss criterion input contract: `CrossEntropyLoss` wants raw logits + class indices (NOT softmaxed, NOT one-hot); `BCEWithLogitsLoss` wants raw logits (NOT sigmoided). Double-activation is a classic silent degrader.
+- In-place ops (`relu_`, `+=` on tensors needing grad) can corrupt autograd — if you see "a leaf Variable that requires grad is being used in an in-place operation" or wrong gradients, hunt these first.
+- Custom `nn.Module`: parameters must be registered (nn.Parameter / submodules / ModuleList — a plain Python list of layers is INVISIBLE to `.parameters()` and silently never trains). Verify: `sum(p.numel() for p in model.parameters())` matches expectation.
+
+## Device & dtype
+
+- No hardcoded `.cuda()`. `device = "cuda" if torch.cuda.is_available() else "cpu"` (or the project's accelerator abstraction) and move model+data consistently.
+- Mixed precision: wrap forward+loss in `autocast`; scale with `GradScaler` (`scaler.scale(loss).backward(); scaler.step(opt); scaler.update()`). Watch for fp16 overflow in losses with large sums — compute sensitive reductions in fp32.
+- `.to(device)` on a Module is in-place-ish; on a Tensor it RETURNS a new tensor — `x.to(device)` without assignment does nothing. Classic.
+
+## Reproducibility & checkpointing
+
+- Seed everything when comparing runs: `torch.manual_seed`, `random`, `numpy`, and note that full determinism needs `torch.use_deterministic_algorithms(True)` + dataloader `worker_init_fn`/`generator` (workers have their own RNG state).
+- Checkpoints save the full resume state: model `state_dict`, optimizer, scheduler, epoch/step, scaler, RNG states, and the config that produced it. A weights-only checkpoint is a demo, not a checkpoint.
+- Load with explicit `map_location`; `strict=False` only with a printed report of missing/unexpected keys — silently ignoring mismatches hides architecture drift.
+
+## DataLoader & input pipeline
+
+- The pipeline is guilty until proven innocent: before blaming the model, visualize/print a decoded batch — labels aligned? augmentation sane? normalization matching the pretrained backbone's expected stats?
+- Shuffle train, don't shuffle val/test. `drop_last=True` if BatchNorm chokes on a size-1 final batch.
+- `num_workers>0` + `pin_memory=True` on GPU; if data loading is the bottleneck (GPU util sawtooth), fix the pipeline before touching the model.
+- Data leakage checks are part of the job: dedupe across splits, split BEFORE augmentation/normalization stats, temporal splits for time series. Suspiciously good val numbers = leakage until disproven.

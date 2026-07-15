@@ -1,0 +1,65 @@
+---
+description: React deep conventions - state, effects, rendering, UX
+globs: ["**/*.tsx", "**/*.jsx"]
+---
+
+# React
+
+## State: derive > lift > store
+
+Decision order for any piece of data:
+1. **Can it be computed from existing props/state?** → compute in render (or `useMemo` if expensive). Do NOT store it.
+2. **Is it server data?** → the project's data layer (React Query/SWR/RSC). Hand-rolled fetch-in-effect with `loading/error/data` states is legacy — only if no data lib exists.
+3. **Is it URL-worthy** (tab, filter, page, selected id)? → router search params, so refresh/share works.
+4. **Truly local UI state?** → `useState` in the closest component that needs it.
+5. **Needed across distant branches?** → context/store, as a last resort.
+
+```tsx
+// ❌ Mirror state — desyncs, extra renders          // ✅ Derive
+const [fullName, setFullName] = useState("");        const fullName = `${first} ${last}`;
+useEffect(() => {                                     const canSubmit = fullName.trim() !== ""
+  setFullName(first + " " + last);                      && email.includes("@");
+}, [first, last]);
+```
+
+## Effects: the last resort, not the first tool
+
+`useEffect` synchronizes with EXTERNAL systems (DOM APIs, subscriptions, analytics, non-React widgets). It is NOT for:
+- transforming data (→ derive in render)
+- responding to a click/submit (→ event handler)
+- resetting state on prop change (→ `key` prop on the component)
+- chaining state updates (→ compute both in one handler)
+
+When an effect is legitimate:
+- Exhaustive deps, always. Never suppress the lint rule — restructure (move fn into effect / `useCallback` / split effect) until deps are honest.
+- Return cleanup for EVERY subscription, timer, observer, abort.
+- Effects must survive running twice (StrictMode does this deliberately to catch you).
+
+## Rendering correctness
+
+- `key` = stable data identity. Index keys break state on reorder/insert/delete.
+- Never define a component inside another component's render — remounts on every render, loses all state.
+- Expensive child re-rendering? Measure first (React Profiler), then: move state down, pass children through, or `memo` + stabilize props. Blanket `useMemo`/`useCallback` everywhere is noise.
+- Lists > ~200 visible rows → virtualize.
+
+## Forms & async UX (where users actually feel quality)
+
+Every async interaction handles four states — loading, error, success, empty:
+- Submit buttons disable while pending (double-submit is a real bug, not polish).
+- Errors are shown to the human near where they acted — never only `console.error`.
+- Field validation on blur/submit with specific messages ("8+ characters required"), not a red border and vibes.
+- Race protection: a stale search response must not overwrite a newer one (abort previous, or compare request ids).
+- Empty states say what to do next, not just a blank area.
+
+## Accessibility — non-negotiable floor
+
+- Interactive = semantic: `<button>`, `<a href>`, `<input>` — never onClick-divs (keyboard + screen reader break).
+- Every input has a `<label>` (or aria-label). Every meaningful image has `alt`; decorative gets `alt=""`.
+- Focus visible and managed: modals trap focus and return it on close; don't remove outlines without replacement.
+- Color is never the only signal (error = icon/text + color).
+
+## Component hygiene
+
+- Props interface declared above the component; destructure in the signature; avoid prop drilling past ~3 levels of unrelated intermediaries.
+- Split when a component mixes concerns (data fetching + complex layout + business rules) — line count is a smell, mixed concerns are the disease.
+- Follow the project's styling system exclusively; use design tokens over hardcoded values.

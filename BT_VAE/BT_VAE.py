@@ -20,7 +20,7 @@ class Config:
     lr: float = 1e-3
     lr2: float = 1e-3
     alpha: float = 0.99
-    beta: float = 1e-5
+    beta: float = 0.001
     eps: float = 1e-5
     pre_epoch: int = 5
     tune_epoch: int = 50
@@ -83,9 +83,10 @@ class BT_VAE(nn.Module):
         log_var = self.log_var(h)
 
         BT = self.encoder(x_left)
+        BT_log_var = self.log_var(BT)
         BT_mu = self.mu(BT)
 
-        return mu, log_var, BT_mu
+        return mu, log_var, BT_mu, BT_log_var
 
     def decode(self, h):
         h = self.decoder(h)
@@ -115,16 +116,44 @@ class BT_VAE(nn.Module):
         return mu + eps * std
 
     def forward(self, x):
-        mu, log_var, BT_mu = self.encode(x)    
+        mu, log_var, BT_mu, BT_log_var = self.encode(x)    
         z = self.reparameter(log_var,mu)
         CM = self.get_CM(BT_mu,mu)
         
         recon = self.decode(z)
 
-        return CM, z, recon, log_var, mu
+        return CM, z, recon, log_var, mu, BT_log_var, BT_mu
         
     @staticmethod
-    def get_BT_VAE_Loss(CM):
+    def get_BT_KL_loss(BT_mu, BT_log_var, mu, log_var, eps=1e-8, tau=1):
+        shape = mu.shape[1]
+        
+        BT_mu = BT_mu.permute(0, 2, 3, 1).reshape(-1, shape)
+        BT_var_flat = BT_log_var.exp().permute(0, 2, 3, 1).reshape(-1, shape)
+
+        mu = mu.permute(0, 2, 3, 1).reshape(-1, shape)
+        var_flat = log_var.exp().permute(0, 2, 3, 1).reshape(-1, shape)
+
+        BT_mean = BT_mu.mean(dim=0).unsqueeze(1)
+        BT_var = BT_var_flat.mean(dim=0) + BT_mu.var(dim=0)
+        BT_var = BT_var.unsqueeze(1) + eps
+
+        mean = mu.mean(dim=0).unsqueeze(0)
+        var = var_flat.mean(dim=0) + mu.var(dim=0)
+        var = var.unsqueeze(0) + eps 
+
+        kl = 0.5 * torch.log(var / BT_var) + (BT_var + (mean - BT_mean).pow(2)) / (2 * var) - 0.5
+
+        shape = kl.shape[0]
+        eye = torch.eye(shape, device = kl.device )
+
+        diag_loss = (kl.diagonal() ** 2).sum()
+        off_diag_loss = (( kl * (1 - eye) - tau * (1 - eye)) ** 2).sum()
+
+        return (diag_loss + off_diag_loss) / (shape * shape)
+
+    @staticmethod
+    def get_BT_VAE_Loss(CM, kl_loss):
         shape = CM.shape[0]
         eye = torch.eye(shape, device=CM.device)
         BT_loss = 0
@@ -138,6 +167,7 @@ class BT_VAE(nn.Module):
                     BT_loss += (eye[i][j] - CM[i][j]).pow(2) * w
 
         BT_loss = BT_loss / (shape * shape)
+        BT_loss += kl_loss
         return BT_loss  
 
     @staticmethod
@@ -146,7 +176,7 @@ class BT_VAE(nn.Module):
         # print(f"fure_recon : {recon_loss}")
         alpha = alpha * (epoch / total_epoch)
         recon_loss = (alpha * dice) + (recon_loss * (1-alpha))
-        kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+        kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
 
         print(f"mu :{mu.mean().item()}, log_var : {log_var.mean().item()}")
         print(f"recon : {recon_loss.item()}, kl_loss : {kl_loss.item()}")
@@ -210,8 +240,10 @@ if __name__ == '__main__':
     op1 = torch.optim.Adam(model.parameters(), lr=Config.lr)
     best_loss = float('inf')
     
-    model.load_state_dict(torch.load('BT_best.pth'))
-
+    try:
+        model.load_state_dict(torch.load('BT_best.pth', map_location=device))
+    except FileNotFoundError:
+        print('BT_best.pth 없음 — 처음부터 학습')
 
     for epoch in range(Config.pre_epoch):
         total_loss = 0
@@ -221,8 +253,9 @@ if __name__ == '__main__':
         for x, y in tqdm(train_loader, desc=f"epoch {epoch}"):
             x = x.to(device)
             
-            CM, z, recon, log_var, mu = model(x)
-            loss = model.get_BT_VAE_Loss(CM)
+            CM, z, recon, log_var, mu, BT_log_var, BT_mu = model(x)
+            kl_loss = model.get_BT_KL_loss(BT_mu, BT_log_var, mu, log_var)
+            loss = model.get_BT_VAE_Loss(CM, kl_loss)
             op1.zero_grad()
             loss.backward()
             op1.step()
@@ -252,10 +285,11 @@ if __name__ == '__main__':
             x = x.to(device)
             y = y.to(device)
 
-            CM, z, recon, log_var, mu = model(x)
+            CM, z, recon, log_var, mu, BT_log_var, BT_mu = model(x)
             dice = model.dice_loss(recon, y, Config.eps)
 
             loss = model.get_VAE_Loss(recon, y, log_var, mu, dice, Config.alpha, Config.beta, Config.tune_epoch, epoch)
+            print(f"mu std :{mu.std().item()}, mu mean :{mu.mean().item()}, log_var : {log_var.mean().item()}")
 
             op2.zero_grad()
             loss.backward()
@@ -285,7 +319,7 @@ if __name__ == '__main__':
         for x, y in tqdm(val_loader, desc=f"epoch {epoch}"):
             x = x.to(device)
             y = y.to(device)
-            CM, z, recon, log_var, mu = model(x)
+            CM, z, recon, log_var, mu, BT_log_var, BT_mu = model(x)
             dice = model.dice_loss(recon, y, Config.eps)
 
             total_loss += model.get_VAE_Loss(recon, y, log_var, mu, dice, Config.alpha, Config.beta).item()

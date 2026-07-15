@@ -1,0 +1,41 @@
+---
+description: Error recovery and stuck-state protocol - what to do when attempts fail
+alwaysApply: true
+---
+
+# Error Recovery & Stuck Protocol
+
+Weak agents loop; strong agents diagnose. The moment a second attempt at the same fix fails, you are officially "stuck" — switch modes.
+
+## The iron rule of retries
+
+**Never retry the same action expecting a different result.** Every retry must differ in a stated way: different hypothesis, more information gathered, different approach. If you can't say what's different, you're not allowed to retry yet.
+
+## Stuck protocol (activate after 2 failed attempts)
+
+1. **Freeze.** Stop editing. Undo/inventory any half-applied changes so you know the exact current state.
+2. **Dump assumptions.** List everything you believe: "the request reaches this handler", "this config is loaded", "this version supports X". You are stuck because at least one of these is false.
+3. **Verify assumptions cheapest-first.** A print/log at the entry point answers "does execution even reach here?" in 10 seconds. Check: right process running? right port/DB/branch? cache stale? file actually saved? env var actually set?
+4. **Shrink the repro.** Cut the failing case down until removing anything makes it pass. The last thing you removed is (near) the cause.
+5. **Read the real source.** Error from a library → open the installed library code / its types at the INSTALLED version (`node_modules/`, site-packages). Changelogs lie less than memory.
+6. **Search the codebase for prior art.** Someone probably faced this; grep the error message, the API name, the pattern.
+7. **Escalate honestly.** After 3 distinct eliminated hypotheses, report to the user: symptom → hypotheses tested → evidence eliminating each → strongest remaining lead → what you'd try with more access. This is a professional deliverable, not failure.
+
+## Hypothesis discipline
+
+Format every debugging move as:
+> **Hypothesis:** the JWT middleware runs before body parsing, so `req.body` is undefined at auth time.
+> **Test:** log middleware execution order / check app.use() sequence.
+> **Result:** confirmed/eliminated → next.
+
+One variable at a time. If you changed three things and it works, revert to isolate which one — otherwise you've planted a superstition in the codebase.
+
+## Environment failures (not your code's fault — still your job)
+
+- Command not found → check the project's package manager scripts, don't install random globals.
+- Permission/network/timeout errors in tooling → report exactly what failed and the command; propose alternatives (different registry, local check) rather than fabricating success.
+- Dependency conflict → read the full resolver output; solve for the ROOT constraint, don't `--force` and pray.
+
+## When the task itself is the problem
+
+If mid-task you discover the request is built on a false premise (the bug is actually intended behavior; the API being integrated is deprecated; the "simple change" requires a schema migration) — STOP and surface it immediately with options. Sunk cost applies to agents too: don't finish a wrong thing because you started it.

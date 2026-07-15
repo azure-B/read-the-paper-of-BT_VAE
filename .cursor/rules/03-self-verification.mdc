@@ -1,0 +1,55 @@
+---
+description: Self-verification before declaring any task complete
+alwaysApply: true
+---
+
+# Self-Verification (the step that separates good from great)
+
+Declaring "done" is a claim. Back it with evidence, every time.
+
+## The verification ladder — climb as high as the environment allows
+
+1. **Run the relevant tests** (narrowest first: the file → the module → the suite)
+2. **Type-check / compile** the project (`tsc --noEmit`, `cargo check`, `mypy`, build command)
+3. **Lint** touched files
+4. **Execute the actual path**: hit the endpoint, run the script, render the page, call the function in a REPL
+5. If NOTHING can be run: perform a line-by-line self-review of the full diff, then explicitly mark the work **unverified** with exact commands for the user
+
+Skipping straight to "done" without touching this ladder is the single most damaging habit an agent can have.
+
+## The self-review pass (mandatory when you can't execute, recommended always)
+
+Re-read your complete diff as a hostile reviewer. Hunt specifically for:
+
+- **Sign/direction errors**: `<` vs `<=` vs `>`, inverted booleans, wrong comparison operand order
+- **Off-by-one**: loop bounds, slice indices, pagination math
+- **Copy-paste artifacts**: duplicated block where one variable wasn't renamed (`userId` used twice where second should be `orgId`)
+- **Async bugs**: missing `await`, promise not returned, race between two writes
+- **Stale references**: renamed a symbol but a string, config, or dynamic access still uses the old name
+- **Resource leaks**: opened but never closed; listener added but never removed
+- **The requirement itself**: re-read the user's original message word by word. Did you do ALL of it? Did they say "and also update the docs"?
+
+Finding your own bug in self-review is a win, not an embarrassment — report it fixed.
+
+## Interpreting verification results honestly
+
+- Test passed but you didn't add a test for the NEW behavior → the new behavior is still unverified. Say so or add the test.
+- Build passed but the change is behavioral (not just types) → build success proves little. Note what it does and doesn't prove.
+- You ran the wrong command / it exited 0 trivially (0 tests collected!) → that is NOT verification. Check the output actually exercised your code.
+- Flaky test failed → re-run once; if it fails twice it's your problem regardless of "it was flaky before."
+
+## Failure handling loop
+
+When verification fails:
+1. Read the ENTIRE error output. Quote the decisive line to yourself.
+2. Diagnose → fix → re-verify. 
+3. **Never report done with a known failure.** If genuinely blocked after 3 distinct fix attempts, stop and report: what fails, the three hypotheses you tested, why each was eliminated, and your best next lead. That report is valuable; a fourth blind attempt usually isn't.
+
+## Done-report template (use this shape)
+
+```
+✅ Done: session expiry added (24h)
+Changed: src/types/session.ts, src/auth/session.ts, src/middleware/auth.ts, tests/auth/expiry.test.ts
+Verified: `pnpm vitest run tests/auth` → 9 passed (incl. 2 new); `pnpm tsc --noEmit` clean
+Note: mobile clients with cached sessions will be forced to re-login once.
+```

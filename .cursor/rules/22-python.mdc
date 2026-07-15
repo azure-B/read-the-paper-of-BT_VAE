@@ -1,0 +1,57 @@
+---
+description: Python deep conventions
+globs: ["**/*.py"]
+---
+
+# Python
+
+## Types & data modeling
+
+- Type-hint every public signature. Python ≥3.10 syntax: `list[str]`, `dict[str, int]`, `int | None` (check the project's floor version in pyproject first).
+- Structured data travels as `@dataclass` (or Pydantic where the project uses it) — not dicts with agreed-upon keys. `frozen=True`/`slots=True` when suitable.
+- Return `None` vs raise: `find_*` may return `None`; `get_*` should raise when missing — and be consistent with the codebase's existing convention.
+- `Enum` for closed sets of options; `Literal` for lightweight string constraints.
+- Never add `# type: ignore` to silence a real error; if third-party stubs are genuinely broken, scope it: `# type: ignore[arg-type]  # lib stubs wrong, see issue #123`.
+
+## The classic traps (check every diff for these)
+
+```python
+# ❌ Mutable default — shared across ALL calls        # ✅
+def add(item, bucket=[]): ...                          def add(item, bucket=None):
+                                                           bucket = [] if bucket is None else bucket
+
+# ❌ Falsy check when 0/"" are valid values            # ✅
+if not user.age: ...                                   if user.age is None: ...
+
+# ❌ Late-binding closure in loop                      # ✅
+fns = [lambda: i for i in range(3)]  # all return 2    fns = [lambda i=i: i for i in range(3)]
+
+# ❌ Bare/blanket except                               # ✅
+try: sync()                                            try: sync()
+except: pass                                           except ConnectionError as e:
+                                                           logger.warning("sync failed: %s", e); raise
+```
+
+- `is None` / `is not None` for None. `==` for values. `is` never for numbers/strings.
+- Don't shadow builtins (`list`, `id`, `type`, `dict`) or stdlib names as module filenames (`email.py`, `token.py` break imports mysteriously).
+- Chained exception context: `raise NewError(...) from e` — keep the cause.
+- Time: timezone-aware always (`datetime.now(timezone.utc)`); naive datetimes are latent bugs.
+
+## Resources & structure
+
+- Context managers for everything openable: files, locks, connections, sessions (`with httpx.Client() as c:`).
+- Imports top-of-file, grouped stdlib/third-party/local, no wildcards. Function-level import only to break a true cycle (and note it).
+- `logging` (module-level `logger = logging.getLogger(__name__)`), lazy formatting `logger.info("user %s", uid)` — not f-strings in log calls, never `print` in libraries.
+- Scripts: `if __name__ == "__main__":` guard; argument parsing via the project's choice (argparse/click/typer).
+- Comprehensions for pure transforms; explicit loops once branching/side effects appear. Generators for large/streaming data.
+
+## Async Python
+
+- Never block the loop: no `time.sleep`, `requests`, or heavy CPU in `async def` — use `asyncio.sleep`, async clients (httpx/aiohttp), or `run_in_executor`/task queues for CPU work.
+- `asyncio.gather` for independent awaits; `TaskGroup` (3.11+) for structured concurrency; every created task must be awaited or supervised — fire-and-forget tasks get GC'd mid-flight.
+
+## Environment discipline
+
+- Add dependencies through the project's manager (uv/poetry/pip-tools) and lockfile — never a stray `pip install` that the next machine won't have.
+- Respect the formatter/linter (ruff/black) config as-is; don't reformat beyond your diff.
+- Verify interpreter version before using new syntax (match statements 3.10+, TaskGroup 3.11+, type parameter syntax 3.12+).

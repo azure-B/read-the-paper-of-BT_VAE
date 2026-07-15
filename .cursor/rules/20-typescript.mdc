@@ -1,0 +1,51 @@
+---
+description: TypeScript/JavaScript deep conventions
+globs: ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.mjs", "**/*.mts", "**/*.cts"]
+---
+
+# TypeScript / JavaScript
+
+## Type system — make illegal states unrepresentable
+
+- `any` is banned. At untyped boundaries use `unknown` and narrow immediately with guards or a schema (zod etc. if present).
+- Discriminated unions over flag combinations:
+
+```ts
+// ❌ 2^3 states, 5 of them impossible          // ✅ exactly the 3 real states
+{ isLoading: boolean; error?: Error;            type State =
+  data?: User[] }                                 | { status: "loading" }
+                                                  | { status: "error"; error: Error }
+                                                  | { status: "ready"; data: User[] };
+```
+
+- Annotate exported signatures explicitly; let inference handle locals. Explicit return types on public functions catch accidental type widening.
+- `as` casts: each one is a claim you must justify. Prefer type guards, `satisfies`, or fixing the source type. `as unknown as X` is a red flag requiring a comment explaining why it's safe.
+- `!` non-null: only when the invariant is visible in the same function; otherwise guard and handle.
+- Model with the right tool: `readonly` for immutables, template literal types for constrained strings (`` `#${string}` ``), `const` objects + `keyof typeof` over `enum` (unless project already uses enums).
+- Never loosen `tsconfig` to make code pass. If `strict` is off in an old project, still write strict-compatible code.
+
+## Async correctness (top bug source — be paranoid)
+
+- Every promise is awaited, returned, or explicitly `void`-ed with a reason. A floating promise is an error you'll never see.
+- `catch (e)` receives `unknown`: `e instanceof Error ? e.message : String(e)`.
+- Parallel independent work: `Promise.all` (fail-fast) vs `Promise.allSettled` (need all results) — choose deliberately. Bound concurrency for big batches.
+- No async work in constructors; use a static `create()` factory.
+- `AbortController` for cancellable fetches in UIs; clean up on unmount/supersession.
+- Sequential state updates racing (double-submit, stale response overwriting fresh): guard with request ids or disable-while-pending.
+
+## Runtime footguns checklist
+
+- `??` vs `||`: `||` treats `0`, `""`, `false` as missing. Default with `??` unless falsy-collapse is intended.
+- `JSON.parse` always throws-capable → wrap or schema-parse at IO boundaries.
+- `Array.prototype.sort` mutates AND compares as strings by default: `[10,9,1].sort()` → `[1,10,9]`. Pass a comparator; spread first if mutation matters.
+- Date pitfalls: month is 0-indexed; never build dates from string concat; store/compare in UTC, format at the edge (use the project's date lib if any).
+- Floating point money: integers of minor units (cents) or a decimal lib — never `0.1 + 0.2` accounting.
+- Object key order, `for...in` inheritance, `typeof null === "object"` — use `Object.entries`, `Array.isArray`, explicit checks.
+- Equality: `===` always; deep equality needs a helper, not `JSON.stringify` comparison (key order!).
+
+## Modules & project hygiene
+
+- Named exports (default only where framework demands). No circular imports — if two modules need each other, a third module wants to exist.
+- Respect path aliases, import grouping, and the package manager the lockfile dictates (pnpm-lock → pnpm; never mix).
+- Node built-ins via `node:` prefix in modern codebases (`import fs from "node:fs/promises"`).
+- Check `engines`/runtime before using bleeding-edge APIs (`Array.groupBy`, `structuredClone` in older targets).

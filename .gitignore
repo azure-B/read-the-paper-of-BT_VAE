@@ -1,4 +1,6 @@
 DataSet/
 .venv/
+.cursor/
+*.md
 JustDoit.code-workspace
 open-wsl.ps1
