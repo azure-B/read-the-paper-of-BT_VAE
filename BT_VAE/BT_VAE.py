@@ -4,46 +4,46 @@ import numpy as np
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
-from torch.utils.data import DataLoader,random_split
+from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
 from get_data import get_data
-# import glob
+
 
 @dataclass
 class Config:
-    stride: int = 1
+    stride: int = 2
     kernel_size: int = 3
-    padding: int = 0
+    padding: int = 1
     output_padding: int = 0
-    z_dim: int = 32  
+    z_dim: int = 32
     lr: float = 1e-3
     lr2: float = 1e-3
-    alpha: float = 0.99
     beta: float = 0.001
-    eps: float = 1e-5
+    pos_weight: float = 30.0     # 배경:전경 ≈ 97:3 → 약 30배
+    dice_smooth: float = 1.0     # dice smooth 항 (기존 1e-5는 너무 작음)
+    eps: float = 1e-5            # BT KL용
     pre_epoch: int = 5
     tune_epoch: int = 50
     batch_size: int = 16
+    log_every: int = 20          # 디버깅 로그 주기 (배치 단위)
+
 
 class BT_VAE(nn.Module):
-    def __init__(self, z_dim=128, stride=2, kernel_size = 3, padding = 1, output_padding = 1):
+    def __init__(self, z_dim=128, stride=2, kernel_size=3, padding=1, output_padding=1):
         super().__init__()
         self.z_dim = z_dim
         self.stride = stride
         self.kernel_size = kernel_size
         self.padding = padding
 
-        # BT pre_trained
-        # we want to matrix output
-        # shape ( batch, 32, 105, 145 )
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size, stride, padding),
             nn.ReLU(),
 
             nn.Conv2d(16, 32, kernel_size, stride, padding),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size = 2, stride = 2),
+            nn.MaxPool2d(kernel_size=2, stride=2),
 
             nn.Conv2d(32, 64, kernel_size, stride, padding),
             nn.ReLU(),
@@ -53,10 +53,11 @@ class BT_VAE(nn.Module):
 
             nn.Conv2d(128, 256, kernel_size, stride, padding),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size = 2, stride = 2)
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
 
-      )
-
+        # 출력은 logits (Sigmoid 제거!)
+        # 확률이 필요하면 밖에서 torch.sigmoid() 적용
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(z_dim, 64, kernel_size, stride, padding, output_padding),
             nn.ReLU(),
@@ -67,17 +68,16 @@ class BT_VAE(nn.Module):
             nn.ConvTranspose2d(32, 16, kernel_size, stride, padding, output_padding),
             nn.ReLU(),
 
-            nn.ConvTranspose2d(16, 1, kernel_size, stride, padding, output_padding),
-            nn.Sigmoid()
+            nn.ConvTranspose2d(16, 1, kernel_size, stride, padding, output_padding)
+            # nn.Sigmoid()  # 제거: BCEWithLogits가 내부에서 처리
         )
 
-        self.log_var = nn.Conv2d( 256, z_dim, kernel_size = 1 )
-        self.mu = nn.Conv2d( 256, z_dim, kernel_size = 1 )
-
+        self.log_var = nn.Conv2d(256, z_dim, kernel_size=1)
+        self.mu = nn.Conv2d(256, z_dim, kernel_size=1)
 
     def encode(self, x):
         x_left = torch.rot90(x, k=1, dims=(-2, -1))
-        
+
         h = self.encoder(x)
         mu = self.mu(h)
         log_var = self.log_var(h)
@@ -90,19 +90,15 @@ class BT_VAE(nn.Module):
 
     def decode(self, h):
         h = self.decoder(h)
-        h = F.interpolate( h, size=( 420, 580 ), mode='bilinear' )
-        return h
+        h = F.interpolate(h, size=(420, 580), mode='bilinear')
+        return h  # logits
 
     def get_CM(self, BT_mu, mu):
         shape = BT_mu.shape[1]
 
-        BT_mu = BT_mu.permute(0, 2, 3, 1)
-        BT_mu = BT_mu.reshape(-1, shape)
-
+        BT_mu = BT_mu.permute(0, 2, 3, 1).reshape(-1, shape)
         N = BT_mu.shape[0]
-
-        mu = mu.permute(0, 2, 3, 1)
-        mu = mu.reshape(-1, shape)
+        mu = mu.permute(0, 2, 3, 1).reshape(-1, shape)
 
         BT_norm = (BT_mu - BT_mu.mean(0)) / (BT_mu.std(0) + 1e-8)
         common_norm = (mu - mu.mean(0)) / (mu.std(0) + 1e-8)
@@ -111,23 +107,23 @@ class BT_VAE(nn.Module):
         return CM
 
     def reparameter(self, log_var, mu):
-        std = torch.exp(log_var*0.5)
+        std = torch.exp(log_var * 0.5)
         eps = torch.randn_like(std)
         return mu + eps * std
 
     def forward(self, x):
-        mu, log_var, BT_mu, BT_log_var = self.encode(x)    
-        z = self.reparameter(log_var,mu)
-        CM = self.get_CM(BT_mu,mu)
-        
-        recon = self.decode(z)
+        mu, log_var, BT_mu, BT_log_var = self.encode(x)
+        z = self.reparameter(log_var, mu)
+        CM = self.get_CM(BT_mu, mu)
 
-        return CM, z, recon, log_var, mu, BT_log_var, BT_mu
-        
+        logits = self.decode(z)
+
+        return CM, z, logits, log_var, mu, BT_log_var, BT_mu
+
     @staticmethod
     def get_BT_KL_loss(BT_mu, BT_log_var, mu, log_var, eps=1e-8, tau=1):
         shape = mu.shape[1]
-        
+
         BT_mu = BT_mu.permute(0, 2, 3, 1).reshape(-1, shape)
         BT_var_flat = BT_log_var.exp().permute(0, 2, 3, 1).reshape(-1, shape)
 
@@ -140,60 +136,49 @@ class BT_VAE(nn.Module):
 
         mean = mu.mean(dim=0).unsqueeze(0)
         var = var_flat.mean(dim=0) + mu.var(dim=0)
-        var = var.unsqueeze(0) + eps 
+        var = var.unsqueeze(0) + eps
 
         kl = 0.5 * torch.log(var / BT_var) + (BT_var + (mean - BT_mean).pow(2)) / (2 * var) - 0.5
 
         shape = kl.shape[0]
-        eye = torch.eye(shape, device = kl.device )
+        eye = torch.eye(shape, device=kl.device)
 
         diag_loss = (kl.diagonal() ** 2).sum()
-        off_diag_loss = (( kl * (1 - eye) - tau * (1 - eye)) ** 2).sum()
+        off_diag_loss = ((kl * (1 - eye) - tau * (1 - eye)) ** 2).sum()
 
         return (diag_loss + off_diag_loss) / (shape * shape)
 
     @staticmethod
-    def get_BT_VAE_Loss(CM, kl_loss):
+    def get_BT_VAE_Loss(CM, kl_loss, w=0.2):
         shape = CM.shape[0]
         eye = torch.eye(shape, device=CM.device)
-        BT_loss = 0
-        w = 0.2
-
-        for i in range(shape):
-            for j in range(shape):
-                if i == j:
-                    BT_loss += (eye[i][j] - CM[i][j]).pow(2)
-                else:
-                    BT_loss += (eye[i][j] - CM[i][j]).pow(2) * w
-
-        BT_loss = BT_loss / (shape * shape)
-        BT_loss += kl_loss
-        return BT_loss  
+        # 이중 for 루프 벡터화 (결과 동일, 훨씬 빠름)
+        weight = eye + (1 - eye) * w
+        BT_loss = ((eye - CM).pow(2) * weight).sum() / (shape * shape)
+        return BT_loss + kl_loss
 
     @staticmethod
-    def get_VAE_Loss(recon, x, log_var, mu, dice, alpha, beta, total_epoch, epoch):
-        recon_loss = F.binary_cross_entropy(recon, x, reduction='mean')
-        # print(f"fure_recon : {recon_loss}")
-        alpha = alpha * (epoch / total_epoch)
-        recon_loss = (alpha * dice) + (recon_loss * (1-alpha))
+    def get_VAE_Loss(logits, y, log_var, mu, beta, pos_weight, smooth=1.0, verbose=False):
+        # BCE (pos_weight로 전경 픽셀 가중) — logits 입력
+        recon_loss = F.binary_cross_entropy_with_logits(
+            logits, y, pos_weight=pos_weight, reduction='mean')
+
+        # Dice — sigmoid 확률로 계산
+        prob = torch.sigmoid(logits)
+        inter = (prob * y).sum(dim=[1, 2, 3]) * 2
+        dice = (inter + smooth) / (prob.sum(dim=[1, 2, 3]) + y.sum(dim=[1, 2, 3]) + smooth)
+        dice_loss = (1 - dice).mean()
+
+        # KL
         kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
 
-        print(f"mu :{mu.mean().item()}, log_var : {log_var.mean().item()}")
-        print(f"recon : {recon_loss.item()}, kl_loss : {kl_loss.item()}")
-        return recon_loss + kl_loss * beta
+        if verbose:
+            print(f"bce: {recon_loss.item():.4f}, dice: {dice_loss.item():.4f}, "
+                  f"kl: {kl_loss.item():.4f}, mu_std: {mu.std().item():.3f}")
 
-    @staticmethod
-    def dice_loss(recon, y, eps):
-        # print(f"means : {recon.mean()}, {y.mean()}")
-        dice = (recon * y).sum(dim=[1, 2, 3]) * 2
-        # print(f"recon * y : {recon * y}")
-        dice = (dice + eps) / ((recon.sum(dim=[1, 2, 3]) + y.sum(dim=[1, 2, 3])) + eps)
-        # print(f"dice : {dice}")
-
-        return (1 - dice).mean()
+        return recon_loss + dice_loss + kl_loss * beta
 
 
-# model Testing
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = BT_VAE(
@@ -203,81 +188,33 @@ if __name__ == '__main__':
         padding=Config.padding,
         output_padding=Config.output_padding,
     )
-
     model.to(device)
 
-    # glob always out list
-    # if i want to input just one file,
-    # i can use np.load
-    # x = np.load('DataSet/Processed/1_/test/1.tif.npy')
+    data = get_data('DataSet/Processed/1_/train', only_p=True)
 
-    # npy to tensor
-    # x = torch.tensor(x).float()
-    # x = x.unsqueeze(0)
-    # x = x.to(device)
-    # print(x.shape)
-
-
-    # print(x.shape)
-    # CM, z, recon, log_var, mu = model(x)
-    # print("CM:", CM.shape)
-    # print("recon:", recon.shape)
-    # loss = model.VAE_Loss(recon, x, log_var, mu, beta=Config.beta)
-    # print(loss.item)
-
-    data = get_data('DataSet/Processed/1_/train', only_p = True)
-    
-    total_len = len(data)
-
-    train_len = int(len(data)*0.7)
-    val_len = int(len(data)-train_len)
-
+    train_len = int(len(data) * 0.7)
+    val_len = len(data) - train_len
     train_data, val_data = random_split(data, [train_len, val_len])
 
-    train_loader = DataLoader(train_data, batch_size = Config.batch_size, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size = Config.batch_size, shuffle=False )
+    train_loader = DataLoader(train_data, batch_size=Config.batch_size, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=Config.batch_size, shuffle=False)
 
-    op1 = torch.optim.Adam(model.parameters(), lr=Config.lr)
-    best_loss = float('inf')
-    
-    try:
-        model.load_state_dict(torch.load('BT_best.pth', map_location=device))
-    except FileNotFoundError:
-        print('BT_best.pth 없음 — 처음부터 학습')
+    # ── 주의: 이전 체크포인트(BT_best.pth / VAE_best.pth)는
+    # Sigmoid 있던 구조 + 붕괴된 가중치라서 로드하지 말 것.
+    # 처음부터 학습해야 함.
 
-    for epoch in range(Config.pre_epoch):
-        total_loss = 0
-        total_BT_loss = 0
-        count = 0
+    # ── BT 사전학습 (원인 분리를 위해 비활성. VAE 단독 학습이 되는 걸 확인한 후 재검토)
+    # op1 = torch.optim.Adam(model.parameters(), lr=Config.lr)
+    # for epoch in range(Config.pre_epoch):
+    #     ...
 
-        for x, y in tqdm(train_loader, desc=f"epoch {epoch}"):
-            x = x.to(device)
-            
-            CM, z, recon, log_var, mu, BT_log_var, BT_mu = model(x)
-            kl_loss = model.get_BT_KL_loss(BT_mu, BT_log_var, mu, log_var)
-            loss = model.get_BT_VAE_Loss(CM, kl_loss)
-            op1.zero_grad()
-            loss.backward()
-            op1.step()
-            total_loss += loss.item()
-            
-            count += 1    
-            total_BT_loss += loss.item()
-            common = total_BT_loss / count 
-
-        if common < best_loss:
-            best_loss = loss.item()
-            torch.save(model.state_dict(), 'BT_best.pth')
-            
-        print(f"epoch {epoch}, BT: { common }")
-
-
+    # ── VAE 학습
     op2 = torch.optim.Adam(model.parameters(), lr=Config.lr2)
     best_loss = float('inf')
-    
+    pos_weight = torch.tensor([Config.pos_weight], device=device)
 
     for epoch in range(Config.tune_epoch):
-        total_loss = 0
+        model.train()
         total_VAE_loss = 0
         count = 0
 
@@ -285,47 +222,55 @@ if __name__ == '__main__':
             x = x.to(device)
             y = y.to(device)
 
-            CM, z, recon, log_var, mu, BT_log_var, BT_mu = model(x)
-            dice = model.dice_loss(recon, y, Config.eps)
+            CM, z, logits, log_var, mu, BT_log_var, BT_mu = model(x)
 
-            loss = model.get_VAE_Loss(recon, y, log_var, mu, dice, Config.alpha, Config.beta, Config.tune_epoch, epoch)
-            print(f"mu std :{mu.std().item()}, mu mean :{mu.mean().item()}, log_var : {log_var.mean().item()}")
+            verbose = (count % Config.log_every == 0)
+            if verbose:
+                prob = torch.sigmoid(logits)
+                print(f"\nmax: {prob.max().item():.3f}, "
+                      f">0.5 비율: {(prob > 0.5).float().mean().item():.4f}, "
+                      f"y 전경 비율: {(y > 0.5).float().mean().item():.4f}")
+
+            loss = model.get_VAE_Loss(
+                logits, y, log_var, mu,
+                Config.beta, pos_weight, Config.dice_smooth, verbose=verbose)
 
             op2.zero_grad()
             loss.backward()
             op2.step()
-            total_VAE_loss += loss.item()
 
-            count += 1    
-            common = total_VAE_loss / count
+            total_VAE_loss += loss.item()
+            count += 1
+
+        common = total_VAE_loss / count
 
         if common < best_loss:
-            best_loss = loss.item()
+            best_loss = common  # (수정) 에폭 평균 기준으로 best 갱신
             torch.save(model.state_dict(), 'VAE_best.pth')
 
-        print(f"epoch {epoch}, VAE: { common }")
+        print(f"epoch {epoch}, VAE: {common:.4f}")
 
-
-
-    data = get_data('DataSet/Processed/1_/train', only_p = False)
-    val_loader = DataLoader(data, batch_size = Config.batch_size, shuffle=False )
-
-
+    # ── 검증 (학습에 안 쓴 val_data 사용)
     model.eval()
-
     with torch.no_grad():
         count = 0
         total_loss = 0
-        for x, y in tqdm(val_loader, desc=f"epoch {epoch}"):
+        total_dice = 0
+        for x, y in tqdm(val_loader, desc="validation"):
             x = x.to(device)
             y = y.to(device)
-            CM, z, recon, log_var, mu, BT_log_var, BT_mu = model(x)
-            dice = model.dice_loss(recon, y, Config.eps)
 
-            total_loss += model.get_VAE_Loss(recon, y, log_var, mu, dice, Config.alpha, Config.beta).item()
+            CM, z, logits, log_var, mu, BT_log_var, BT_mu = model(x)
+
+            total_loss += model.get_VAE_Loss(
+                logits, y, log_var, mu,
+                Config.beta, pos_weight, Config.dice_smooth).item()
+
+            # dice score(높을수록 좋음)도 따로 집계
+            prob = torch.sigmoid(logits)
+            inter = (prob * y).sum(dim=[1, 2, 3]) * 2
+            dice = (inter + 1.0) / (prob.sum(dim=[1, 2, 3]) + y.sum(dim=[1, 2, 3]) + 1.0)
+            total_dice += dice.mean().item()
             count += 1
 
-        print(f"total_loss : {total_loss/count}")
-            
-
-
+        print(f"val loss : {total_loss / count:.4f}, val dice : {total_dice / count:.4f}")
