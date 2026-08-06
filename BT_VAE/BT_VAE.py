@@ -4,7 +4,7 @@ import numpy as np
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Dataset
 from tqdm import tqdm
 
 from get_data import get_data
@@ -17,25 +17,81 @@ class Config:
     padding: int = 1
     output_padding: int = 0
     z_dim: int = 32
-    lr: float = 1e-3
+    out_size: tuple = (420, 580)
+
+    # VAE 학습
     lr2: float = 1e-3
     beta: float = 0.001
-    pos_weight: float = 30.0     # 배경:전경 ≈ 97:3 → 약 30배
-    dice_smooth: float = 1.0     # dice smooth 항 (기존 1e-5는 너무 작음)
-    eps: float = 1e-5            # BT KL용
-    pre_epoch: int = 5
+    pos_weight: float = 30.0
+    dice_smooth: float = 1.0
     tune_epoch: int = 50
     batch_size: int = 16
-    log_every: int = 20          # 디버깅 로그 주기 (배치 단위)
+
+    # BT 사전학습
+    lr: float = 1e-3
+    pre_epoch: int = 20
+    bt_batch_size: int = 64      # OOM 나면 32로
+    proj_dim: int = 512
+    lambd: float = 0.005
+
+    log_every: int = 20
+
+
+# ──────────────────────────────────────────────
+# [수정 2] BT 전용 Dataset 래퍼: x만 반환 (라벨 유무/형식과 무관하게 동작)
+# ──────────────────────────────────────────────
+class ImageOnly(Dataset):
+    def __init__(self, base):
+        self.base = base
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        item = self.base[i]
+        # (x, y) 튜플이면 x만, 아니면 그대로
+        return item[0] if isinstance(item, (tuple, list)) else item
+
+
+# ──────────────────────────────────────────────
+# [수정 3] 샘플별 독립 augmentation
+# ──────────────────────────────────────────────
+def bt_augment(x):
+    B, C, H, W = x.shape
+    device = x.device
+
+    # horizontal flip — 샘플별 p=0.5
+    flip = torch.rand(B, 1, 1, 1, device=device) < 0.5
+    x = torch.where(flip, torch.flip(x, dims=[-1]), x)
+
+    # random resized crop — 샘플별 (scale 0.7~1.0)
+    out = torch.empty_like(x)
+    for i in range(B):
+        s = 0.7 + 0.3 * torch.rand(1).item()
+        ch, cw = int(H * s), int(W * s)
+        top = torch.randint(0, H - ch + 1, (1,)).item()
+        left = torch.randint(0, W - cw + 1, (1,)).item()
+        crop = x[i:i + 1, :, top:top + ch, left:left + cw]
+        out[i:i + 1] = F.interpolate(crop, size=(H, W),
+                                     mode='bilinear', align_corners=False)
+    x = out
+
+    # 밝기 스케일 — 샘플별 (0.8~1.2배)
+    scale = 0.8 + 0.4 * torch.rand(B, 1, 1, 1, device=device)
+    x = x * scale
+
+    # 가우시안 노이즈 (원소별)
+    x = x + torch.randn_like(x) * 0.03
+
+    return x.clamp(0, 1)  # 입력이 [0,1] 정규화라는 가정. z-score면 clamp 제거할 것
 
 
 class BT_VAE(nn.Module):
-    def __init__(self, z_dim=128, stride=2, kernel_size=3, padding=1, output_padding=1):
+    def __init__(self, z_dim=32, stride=2, kernel_size=3, padding=1,
+                 output_padding=0, proj_dim=512, out_size=(420, 580)):
         super().__init__()
         self.z_dim = z_dim
-        self.stride = stride
-        self.kernel_size = kernel_size
-        self.padding = padding
+        self.out_size = out_size
 
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size, stride, padding),
@@ -56,8 +112,7 @@ class BT_VAE(nn.Module):
             nn.MaxPool2d(kernel_size=2, stride=2)
         )
 
-        # 출력은 logits (Sigmoid 제거!)
-        # 확률이 필요하면 밖에서 torch.sigmoid() 적용
+        # 출력은 logits (Sigmoid 없음)
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(z_dim, 64, kernel_size, stride, padding, output_padding),
             nn.ReLU(),
@@ -69,107 +124,68 @@ class BT_VAE(nn.Module):
             nn.ReLU(),
 
             nn.ConvTranspose2d(16, 1, kernel_size, stride, padding, output_padding)
-            # nn.Sigmoid()  # 제거: BCEWithLogits가 내부에서 처리
         )
 
         self.log_var = nn.Conv2d(256, z_dim, kernel_size=1)
         self.mu = nn.Conv2d(256, z_dim, kernel_size=1)
 
+        # ── BT 사전학습 전용
+        self.projector = nn.Sequential(
+            nn.Linear(256, proj_dim, bias=False),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_dim, proj_dim, bias=False),
+        )
+        self.bn = nn.BatchNorm1d(proj_dim, affine=False)
+
+    # ────────────── BT 사전학습 ──────────────
+    def bt_loss(self, x1, x2, lambd=0.005):
+        h1 = self.encoder(x1).mean(dim=[2, 3])   # GAP → (B, 256)
+        h2 = self.encoder(x2).mean(dim=[2, 3])
+
+        z1 = self.projector(h1)
+        z2 = self.projector(h2)
+
+        B = z1.shape[0]
+        c = (self.bn(z1).T @ self.bn(z2)) / B
+
+        on_diag = (torch.diagonal(c) - 1).pow(2).sum()
+        n = c.shape[0]
+        off_diag = (c.flatten()[:-1].view(n - 1, n + 1)[:, 1:]).pow(2).sum()
+
+        return on_diag + lambd * off_diag, on_diag.item(), off_diag.item()
+
+    # ────────────── VAE ──────────────
     def encode(self, x):
-        x_left = torch.rot90(x, k=1, dims=(-2, -1))
-
         h = self.encoder(x)
-        mu = self.mu(h)
-        log_var = self.log_var(h)
-
-        BT = self.encoder(x_left)
-        BT_log_var = self.log_var(BT)
-        BT_mu = self.mu(BT)
-
-        return mu, log_var, BT_mu, BT_log_var
+        return self.mu(h), self.log_var(h)
 
     def decode(self, h):
         h = self.decoder(h)
-        h = F.interpolate(h, size=(420, 580), mode='bilinear')
-        return h  # logits
-
-    def get_CM(self, BT_mu, mu):
-        shape = BT_mu.shape[1]
-
-        BT_mu = BT_mu.permute(0, 2, 3, 1).reshape(-1, shape)
-        N = BT_mu.shape[0]
-        mu = mu.permute(0, 2, 3, 1).reshape(-1, shape)
-
-        BT_norm = (BT_mu - BT_mu.mean(0)) / (BT_mu.std(0) + 1e-8)
-        common_norm = (mu - mu.mean(0)) / (mu.std(0) + 1e-8)
-
-        CM = torch.matmul(BT_norm.T, common_norm) / N
-        return CM
+        return F.interpolate(h, size=self.out_size,
+                             mode='bilinear', align_corners=False)  # logits
 
     def reparameter(self, log_var, mu):
         std = torch.exp(log_var * 0.5)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+        return mu + torch.randn_like(std) * std
 
-    def forward(self, x):
-        mu, log_var, BT_mu, BT_log_var = self.encode(x)
-        z = self.reparameter(log_var, mu)
-        CM = self.get_CM(BT_mu, mu)
-
+    # [수정 1] 추론/검증은 sample=False로 결정적 경로 (z = mu)
+    def forward(self, x, sample=True):
+        mu, log_var = self.encode(x)
+        z = self.reparameter(log_var, mu) if sample else mu
         logits = self.decode(z)
-
-        return CM, z, logits, log_var, mu, BT_log_var, BT_mu
-
-    @staticmethod
-    def get_BT_KL_loss(BT_mu, BT_log_var, mu, log_var, eps=1e-8, tau=1):
-        shape = mu.shape[1]
-
-        BT_mu = BT_mu.permute(0, 2, 3, 1).reshape(-1, shape)
-        BT_var_flat = BT_log_var.exp().permute(0, 2, 3, 1).reshape(-1, shape)
-
-        mu = mu.permute(0, 2, 3, 1).reshape(-1, shape)
-        var_flat = log_var.exp().permute(0, 2, 3, 1).reshape(-1, shape)
-
-        BT_mean = BT_mu.mean(dim=0).unsqueeze(1)
-        BT_var = BT_var_flat.mean(dim=0) + BT_mu.var(dim=0)
-        BT_var = BT_var.unsqueeze(1) + eps
-
-        mean = mu.mean(dim=0).unsqueeze(0)
-        var = var_flat.mean(dim=0) + mu.var(dim=0)
-        var = var.unsqueeze(0) + eps
-
-        kl = 0.5 * torch.log(var / BT_var) + (BT_var + (mean - BT_mean).pow(2)) / (2 * var) - 0.5
-
-        shape = kl.shape[0]
-        eye = torch.eye(shape, device=kl.device)
-
-        diag_loss = (kl.diagonal() ** 2).sum()
-        off_diag_loss = ((kl * (1 - eye) - tau * (1 - eye)) ** 2).sum()
-
-        return (diag_loss + off_diag_loss) / (shape * shape)
-
-    @staticmethod
-    def get_BT_VAE_Loss(CM, kl_loss, w=0.2):
-        shape = CM.shape[0]
-        eye = torch.eye(shape, device=CM.device)
-        # 이중 for 루프 벡터화 (결과 동일, 훨씬 빠름)
-        weight = eye + (1 - eye) * w
-        BT_loss = ((eye - CM).pow(2) * weight).sum() / (shape * shape)
-        return BT_loss + kl_loss
+        return logits, mu, log_var
 
     @staticmethod
     def get_VAE_Loss(logits, y, log_var, mu, beta, pos_weight, smooth=1.0, verbose=False):
-        # BCE (pos_weight로 전경 픽셀 가중) — logits 입력
         recon_loss = F.binary_cross_entropy_with_logits(
             logits, y, pos_weight=pos_weight, reduction='mean')
 
-        # Dice — sigmoid 확률로 계산
         prob = torch.sigmoid(logits)
         inter = (prob * y).sum(dim=[1, 2, 3]) * 2
         dice = (inter + smooth) / (prob.sum(dim=[1, 2, 3]) + y.sum(dim=[1, 2, 3]) + smooth)
         dice_loss = (1 - dice).mean()
 
-        # KL
         kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
 
         if verbose:
@@ -179,6 +195,7 @@ class BT_VAE(nn.Module):
         return recon_loss + dice_loss + kl_loss * beta
 
 
+# ══════════════════════════════════════════════
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = BT_VAE(
@@ -187,30 +204,70 @@ if __name__ == '__main__':
         kernel_size=Config.kernel_size,
         padding=Config.padding,
         output_padding=Config.output_padding,
-    )
-    model.to(device)
+        proj_dim=Config.proj_dim,
+        out_size=Config.out_size,
+    ).to(device)
 
+    # ────────────────────────────────────────
+    # 1) BT 사전학습
+    # ────────────────────────────────────────
+    RUN_BT = True   # BT 유무 비교 실험 시 토글
+
+    if RUN_BT:
+        bt_data = ImageOnly(get_data('DataSet/Processed/1_/train', only_p=False))
+        bt_loader = DataLoader(bt_data, batch_size=Config.bt_batch_size,
+                               shuffle=True, drop_last=True,
+                               num_workers=2, pin_memory=True)
+
+        # BT에서 실제로 학습되는 파라미터만 (encoder + projector)
+        op1 = torch.optim.Adam(
+            list(model.encoder.parameters()) + list(model.projector.parameters()),
+            lr=Config.lr)
+
+        for epoch in range(Config.pre_epoch):
+            model.train()
+            total, tot_on, tot_off, count = 0, 0, 0, 0
+            for x in tqdm(bt_loader, desc=f"BT epoch {epoch}"):
+                x = x.to(device)
+                x1, x2 = bt_augment(x), bt_augment(x)
+
+                loss, on_d, off_d = model.bt_loss(x1, x2, Config.lambd)
+
+                op1.zero_grad()
+                loss.backward()
+                op1.step()
+                total += loss.item()
+                tot_on += on_d
+                tot_off += off_d
+                count += 1
+
+            print(f"BT epoch {epoch}: loss {total / count:.4f} "
+                  f"(on_diag {tot_on / count:.4f}, off_diag {tot_off / count:.4f})")
+
+        torch.save(model.state_dict(), 'BT_pretrained.pth')
+
+    # ────────────────────────────────────────
+    # 2) VAE 학습 (fine-tune)
+    # ────────────────────────────────────────
     data = get_data('DataSet/Processed/1_/train', only_p=True)
 
     train_len = int(len(data) * 0.7)
     val_len = len(data) - train_len
-    train_data, val_data = random_split(data, [train_len, val_len])
+    train_data, val_data = random_split(
+        data, [train_len, val_len],
+        generator=torch.Generator().manual_seed(42))
 
-    train_loader = DataLoader(train_data, batch_size=Config.batch_size, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size=Config.batch_size, shuffle=False)
+    train_loader = DataLoader(train_data, batch_size=Config.batch_size, shuffle=True,
+                              num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_data, batch_size=Config.batch_size, shuffle=False,
+                            num_workers=2, pin_memory=True)
 
-    # ── 주의: 이전 체크포인트(BT_best.pth / VAE_best.pth)는
-    # Sigmoid 있던 구조 + 붕괴된 가중치라서 로드하지 말 것.
-    # 처음부터 학습해야 함.
+    # 시각화용 고정 샘플 (val에서 한 번만 뽑아 매 epoch 같은 이미지로 비교)
+    fixed_x, fixed_y = next(iter(val_loader))
+    fixed_x, fixed_y = fixed_x.to(device), fixed_y.to(device)
 
-    # ── BT 사전학습 (원인 분리를 위해 비활성. VAE 단독 학습이 되는 걸 확인한 후 재검토)
-    # op1 = torch.optim.Adam(model.parameters(), lr=Config.lr)
-    # for epoch in range(Config.pre_epoch):
-    #     ...
-
-    # ── VAE 학습
     op2 = torch.optim.Adam(model.parameters(), lr=Config.lr2)
-    best_loss = float('inf')
+    best_dice = 0.0
     pos_weight = torch.tensor([Config.pos_weight], device=device)
 
     for epoch in range(Config.tune_epoch):
@@ -222,7 +279,7 @@ if __name__ == '__main__':
             x = x.to(device)
             y = y.to(device)
 
-            CM, z, logits, log_var, mu, BT_log_var, BT_mu = model(x)
+            logits, mu, log_var = model(x)   # 학습은 sample=True (기본)
 
             verbose = (count % Config.log_every == 0)
             if verbose:
@@ -244,33 +301,35 @@ if __name__ == '__main__':
 
         common = total_VAE_loss / count
 
-        if common < best_loss:
-            best_loss = common  # (수정) 에폭 평균 기준으로 best 갱신
+        # ── validation dice: 결정적 경로(sample=False), per-image 집계
+        model.eval()
+        dices = []
+        with torch.no_grad():
+            for vx, vy in val_loader:
+                vx, vy = vx.to(device), vy.to(device)
+                vlogits, _, _ = model(vx, sample=False)   # [수정 1]
+                p = torch.sigmoid(vlogits)
+                inter = (p * vy).sum(dim=[1, 2, 3]) * 2
+                d = (inter + 1.0) / (p.sum(dim=[1, 2, 3]) + vy.sum(dim=[1, 2, 3]) + 1.0)
+                dices.extend(d.cpu().tolist())            # 이미지별로 모아서
+        val_dice = sum(dices) / len(dices)                # 전체 평균 (배치 크기 편향 제거)
+
+        if val_dice > best_dice:
+            best_dice = val_dice
             torch.save(model.state_dict(), 'VAE_best.pth')
+        torch.save(model.state_dict(), 'last.pth')
 
-        print(f"epoch {epoch}, VAE: {common:.4f}")
+        print(f"epoch {epoch}, train loss: {common:.4f}, "
+              f"val dice: {val_dice:.4f} (best {best_dice:.4f})")
 
-    # ── 검증 (학습에 안 쓴 val_data 사용)
-    model.eval()
-    with torch.no_grad():
-        count = 0
-        total_loss = 0
-        total_dice = 0
-        for x, y in tqdm(val_loader, desc="validation"):
-            x = x.to(device)
-            y = y.to(device)
-
-            CM, z, logits, log_var, mu, BT_log_var, BT_mu = model(x)
-
-            total_loss += model.get_VAE_Loss(
-                logits, y, log_var, mu,
-                Config.beta, pos_weight, Config.dice_smooth).item()
-
-            # dice score(높을수록 좋음)도 따로 집계
-            prob = torch.sigmoid(logits)
-            inter = (prob * y).sum(dim=[1, 2, 3]) * 2
-            dice = (inter + 1.0) / (prob.sum(dim=[1, 2, 3]) + y.sum(dim=[1, 2, 3]) + 1.0)
-            total_dice += dice.mean().item()
-            count += 1
-
-        print(f"val loss : {total_loss / count:.4f}, val dice : {total_dice / count:.4f}")
+        # 5 epoch마다 고정 val 샘플로 예측 시각화
+        if epoch % 5 == 0:
+            with torch.no_grad():
+                fl, _, _ = model(fixed_x, sample=False)
+                prob = torch.sigmoid(fl[0, 0]).cpu().numpy()
+            fig, ax = plt.subplots(1, 3, figsize=(15, 4))
+            ax[0].imshow(fixed_x[0, 0].cpu(), cmap='gray'); ax[0].set_title('input')
+            ax[1].imshow(fixed_y[0, 0].cpu(), cmap='gray'); ax[1].set_title('GT')
+            ax[2].imshow(prob, cmap='gray'); ax[2].set_title(f'pred (epoch {epoch})')
+            plt.savefig(f'pred_epoch{epoch}.png'); plt.close()
+            model.train()
