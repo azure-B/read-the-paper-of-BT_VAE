@@ -1,3 +1,4 @@
+import os
 import cv2
 import torch
 import numpy as np
@@ -145,3 +146,91 @@ for file in mask_files :
 
     # Save np
     np.save(f"DataSet/Processed/1_/{parent_folder}/{pathlib.Path(file).name}", proceesed)
+ 
+frame_files = sorted(glob.glob('DataSet/2_/frames/*.png'))
+ 
+out_dir2 = 'DataSet/Processed/2_/train'
+os.makedirs(out_dir2, exist_ok=True)
+ 
+count = 0
+skip = 0
+ 
+for file in frame_files:
+ 
+    # masks 폴더에서 같은 이름 찾기
+    mask_file = 'DataSet/2_/masks/' + pathlib.Path(file).name
+ 
+    if not os.path.exists(mask_file):
+        skip += 1
+        continue
+ 
+    # ----- image : grayscale -> [0,1] -> (1,H,W)
+    img = cv2.imread(file, cv2.IMREAD_GRAYSCALE)
+    img = torch.from_numpy(img).float()
+    img = img.unsqueeze(0) / 255
+ 
+    # ----- mask : threshold 128 -> 0/1 -> (1,H,W)
+    mask = cv2.imread(mask_file, cv2.IMREAD_GRAYSCALE)
+    _, mask = cv2.threshold(mask, 128, 1, cv2.THRESH_BINARY)
+    mask = torch.from_numpy(mask).float()
+    mask = mask.unsqueeze(0)
+ 
+    # ----- Save np
+    name = pathlib.Path(file).name
+    np.save(f"{out_dir2}/{name}", img)
+    np.save(f"{out_dir2}/{name.replace('.png', '_mask.png')}", mask)
+ 
+    count += 1
+ 
+print(f"[COVID] {count}쌍 저장 -> {out_dir2} (마스크 없어 건너뜀 {skip})")
+ 
+ 
+# ----------------------------------------------------------------------------------------
+# 검증 : 제대로 저장됐는지 확인
+# shape / 값 범위 / positive-negative 개수
+ 
+check_list = [
+    ('DataSet/Processed/1_/train', 'tif'),
+    ('DataSet/Processed/2_/train', 'png'),
+]
+ 
+os.makedirs('DataSet/Processed/1_/train', exist_ok=True)
+os.makedirs('DataSet/Processed/1_/test', exist_ok=True)
+
+for check_dir, ext in check_list:
+ 
+    files = sorted(glob.glob(f"{check_dir}/*.npy"))
+    img_files = [f for f in files if '_mask.' not in pathlib.Path(f).name]
+ 
+    print(f"\n[검증] {check_dir} : 파일 {len(files)}개 ({len(img_files)}쌍)")
+ 
+    if len(img_files) == 0:
+        continue
+ 
+    shapes = set()
+    n_pos = 0
+    fg_list = []
+ 
+    for f in img_files:
+        mf = f.replace(f'.{ext}.npy', f'_mask.{ext}.npy')
+        if not os.path.exists(mf):
+            continue
+ 
+        m = np.load(mf)
+        shapes.add(m.shape)
+ 
+        if m.sum() > 0:
+            n_pos += 1
+            fg_list.append(m.mean())
+ 
+    x = np.load(img_files[0])
+    y = np.load(img_files[0].replace(f'.{ext}.npy', f'_mask.{ext}.npy'))
+ 
+    print(f"  shape : {shapes}")
+    print(f"  positive {n_pos} / negative {len(img_files) - n_pos}")
+    if len(fg_list) > 0:
+        print(f"  positive 전경비율 : 평균 {np.mean(fg_list):.4f} "
+              f"(min {np.min(fg_list):.4f}, max {np.max(fg_list):.4f})")
+    print(f"  x : {x.shape} {x.dtype} range [{x.min():.3f}, {x.max():.3f}]")
+    print(f"  y : {y.shape} {y.dtype} 고유값 {np.unique(y)}")
+ 
